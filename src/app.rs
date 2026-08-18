@@ -44,6 +44,7 @@ pub struct App {
     pub message: Option<String>,
     pub show_help: bool,
     pub output: Option<String>,
+    pub preview_scroll: u16,
     pane_split_percent: u16,
     dragging_divider: bool,
     should_quit: bool,
@@ -69,6 +70,7 @@ impl App {
             message: None,
             show_help: false,
             output: None,
+            preview_scroll: 0,
             pane_split_percent: DEFAULT_TREE_PANE_PERCENT,
             dragging_divider: false,
             should_quit: false,
@@ -100,9 +102,13 @@ impl App {
             return;
         }
 
+        let selected_before = self.selected;
         match self.input_mode {
             InputMode::Normal => self.handle_normal_key(key),
             InputMode::Search | InputMode::Jump => self.handle_input_key(key),
+        }
+        if self.selected != selected_before {
+            self.preview_scroll = 0;
         }
     }
 
@@ -416,19 +422,78 @@ impl App {
         .clamp(1, 99) as u16;
     }
 
+    fn tree_view_offset(&self, viewport_height: u16) -> usize {
+        self.selected_visible_index()
+            .saturating_sub(usize::from(viewport_height).saturating_sub(1))
+    }
+
+    fn select_tree_row(&mut self, mouse: MouseEvent, body: Rect) {
+        let row = usize::from(mouse.row.saturating_sub(body.y));
+        let index = self.tree_view_offset(body.height).saturating_add(row);
+        let Some(&id) = self.visible.get(index) else {
+            return;
+        };
+
+        let indent_width = self.tree.node(id).depth.min(usize::from(u16::MAX)) as u16;
+        let disclosure_column = body
+            .x
+            .saturating_add(1) // the list's selection marker
+            .saturating_add(indent_width.saturating_mul(2));
+        let clicked_disclosure = mouse.column == disclosure_column;
+        let selected_before = self.selected;
+        self.selected = id;
+        if self.selected != selected_before {
+            self.preview_scroll = 0;
+        }
+        if clicked_disclosure {
+            self.toggle_current();
+        }
+    }
+
+    fn scroll_preview(&mut self, direction: isize, area: Rect) {
+        let maximum = ui::preview_max_scroll(self, area);
+        let current = self.preview_scroll.min(maximum);
+        self.preview_scroll = if direction < 0 {
+            current.saturating_sub(direction.unsigned_abs() as u16)
+        } else {
+            current.saturating_add(direction as u16).min(maximum)
+        };
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent, body: Rect) {
+        if self.show_help {
+            return;
+        }
+
+        let over_body = mouse.row >= body.y
+            && mouse.row < body.bottom()
+            && mouse.column >= body.x
+            && mouse.column < body.right();
+        let tree_width = self.tree_pane_width(body.width);
+        let right_x = body.x.saturating_add(tree_width);
+        let right_area = Rect::new(
+            right_x,
+            body.y,
+            body.right().saturating_sub(right_x),
+            body.height,
+        );
+        let selected_before = self.selected;
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.move_by(-3),
-            MouseEventKind::ScrollDown => self.move_by(3),
-            MouseEventKind::Down(MouseButton::Left) => {
-                let divider = body
-                    .x
-                    .saturating_add(self.tree_pane_width(body.width))
-                    .saturating_sub(1);
-                let over_body = mouse.row >= body.y && mouse.row < body.bottom();
-                if over_body && mouse.column.abs_diff(divider) <= 1 {
+            MouseEventKind::ScrollUp if over_body && mouse.column >= right_x => {
+                self.scroll_preview(-3, right_area)
+            }
+            MouseEventKind::ScrollDown if over_body && mouse.column >= right_x => {
+                self.scroll_preview(3, right_area)
+            }
+            MouseEventKind::ScrollUp if over_body => self.move_by(-3),
+            MouseEventKind::ScrollDown if over_body => self.move_by(3),
+            MouseEventKind::Down(MouseButton::Left) if over_body => {
+                let divider = body.x.saturating_add(tree_width).saturating_sub(1);
+                if mouse.column.abs_diff(divider) <= 1 {
                     self.dragging_divider = true;
                     self.resize_to_column(mouse.column, body);
+                } else if mouse.column < divider {
+                    self.select_tree_row(mouse, body);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
@@ -439,6 +504,9 @@ impl App {
                 self.dragging_divider = false;
             }
             _ => {}
+        }
+        if self.selected != selected_before {
+            self.preview_scroll = 0;
         }
     }
 }
@@ -596,6 +664,72 @@ mod tests {
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 57, 1), body);
         assert!(!app.is_dragging_divider());
+    }
+
+    #[test]
+    fn clicking_a_tree_row_selects_it() {
+        let mut app = App::new(json!({"a": 1, "b": 2}), "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 10);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 5), body);
+
+        assert_eq!(app.tree.path(app.selected), "/b");
+    }
+
+    #[test]
+    fn clicking_a_tree_row_accounts_for_the_visible_list_offset() {
+        let value = Value::Array((0..20).map(Value::from).collect());
+        let mut app = App::new(value, "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 5);
+        app.selected = app.visible[15];
+
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, body.y),
+            body,
+        );
+
+        assert_eq!(app.selected_visible_index(), 11);
+    }
+
+    #[test]
+    fn clicking_a_disclosure_marker_toggles_the_container() {
+        let mut app = App::new(json!({"a": 1}), "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 10);
+
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, body.y),
+            body,
+        );
+
+        assert!(!app.tree.node(0).expanded);
+        assert_eq!(app.visible, vec![0]);
+    }
+
+    #[test]
+    fn mouse_wheel_targets_the_pane_under_the_pointer() {
+        let value = Value::Array((0..20).map(Value::from).collect());
+        let mut app = App::new(value, "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 5);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 70, 4), body);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.preview_scroll, 3);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 10, 4), body);
+        assert_eq!(app.selected_visible_index(), 3);
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn divider_drag_ends_even_when_the_pointer_leaves_the_body() {
+        let mut app = App::new(json!({}), "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 20);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 57, 10), body);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 75, 1), body);
+
+        assert!(!app.is_dragging_divider());
+        assert_eq!(app.tree_pane_width(body.width), 76);
     }
 
     #[test]

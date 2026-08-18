@@ -144,8 +144,28 @@ fn tree_item(app: &App, id: NodeId) -> ListItem<'static> {
 }
 
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
+    let preview_area = preview_area(area);
+    let preview = preview_widget(app);
+    let content_height = preview.line_count(preview_area.width);
+    let maximum_scroll = content_height.saturating_sub(usize::from(preview_area.height));
+    let scroll = usize::from(app.preview_scroll).min(maximum_scroll) as u16;
+    frame.render_widget(preview.scroll((scroll, 0)), preview_area);
+
+    if maximum_scroll > 0 {
+        let mut scrollbar_state = ScrollbarState::new(content_height)
+            .position(usize::from(scroll))
+            .viewport_content_length(usize::from(preview_area.height));
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None);
+        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+    }
+}
+
+fn preview_widget(app: &App) -> Paragraph<'static> {
     let value = app.tree.value_at(app.selected);
-    let preview = Paragraph::new(highlight_json(value))
+    Paragraph::new(highlight_json(value))
         .block(
             Block::default()
                 .title(format!(
@@ -154,14 +174,22 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
                 ))
                 .borders(Borders::NONE),
         )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(
-        preview,
-        area.inner(Margin {
-            vertical: 0,
-            horizontal: 1,
-        }),
-    );
+        .wrap(Wrap { trim: false })
+}
+
+fn preview_area(area: Rect) -> Rect {
+    area.inner(Margin {
+        vertical: 0,
+        horizontal: 1,
+    })
+}
+
+pub(crate) fn preview_max_scroll(app: &App, area: Rect) -> u16 {
+    let area = preview_area(area);
+    let content_height = preview_widget(app).line_count(area.width);
+    content_height
+        .saturating_sub(usize::from(area.height))
+        .min(usize::from(u16::MAX)) as u16
 }
 
 fn highlight_json(value: &Value) -> Text<'static> {
@@ -277,7 +305,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let area = centered_rect(68, 26, frame.area());
+    let area = centered_rect(68, 28, frame.area());
     frame.render_widget(Clear, area);
     let help = vec![
         Line::from(Span::styled("Navigate", Style::default().fg(ACCENT).bold())),
@@ -304,6 +332,8 @@ fn draw_help(frame: &mut Frame) {
         Line::from("  Space/Enter     expand or collapse"),
         Line::from("  e/c             expand / collapse the entire branch"),
         Line::from("  -/+             resize the tree and value panes"),
+        Line::from("  Mouse click     select a tree row; disclosure toggles it"),
+        Line::from("  Mouse wheel     move the tree or scroll the hovered value"),
         Line::from("  Mouse drag      resize using the pane divider"),
         Line::from("  Esc             clear the active search"),
         Line::from("  p / P           print selected value / path and quit"),

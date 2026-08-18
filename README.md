@@ -41,7 +41,7 @@ The left pane is the document tree. The right pane shows the complete JSON value
 | `e` / `c` | Expand / collapse the whole selected branch |
 | `-` / `+` | Shrink / grow the tree pane |
 
-You can also drag the divider between the tree and value panes with the mouse. Both panes retain a minimum usable width.
+You can click a row in the tree to select it, or click its disclosure marker to expand or collapse it. The mouse wheel follows the pointer: over the tree it changes the selected row, and over the value pane it scrolls the formatted JSON. You can also drag the divider between the panes; both retain a minimum usable width.
 
 ## Finding and returning
 
