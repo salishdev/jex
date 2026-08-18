@@ -7,12 +7,12 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use serde_json::Value;
 
 use crate::{
@@ -26,6 +26,9 @@ pub enum InputMode {
     Search,
     Jump,
 }
+
+const DEFAULT_TREE_PANE_PERCENT: u16 = 58;
+const MIN_PANE_WIDTH: u16 = 20;
 
 pub struct App {
     pub tree: JsonTree,
@@ -41,6 +44,8 @@ pub struct App {
     pub message: Option<String>,
     pub show_help: bool,
     pub output: Option<String>,
+    pane_split_percent: u16,
+    dragging_divider: bool,
     should_quit: bool,
     history: Vec<NodeId>,
     history_index: usize,
@@ -64,6 +69,8 @@ impl App {
             message: None,
             show_help: false,
             output: None,
+            pane_split_percent: DEFAULT_TREE_PANE_PERCENT,
+            dragging_divider: false,
             should_quit: false,
             history: vec![0],
             history_index: 0,
@@ -138,6 +145,8 @@ impl App {
                 self.tree.collapse_descendants(self.selected);
                 self.refresh_visible();
             }
+            (KeyCode::Char('-'), _) => self.resize_panes(-5),
+            (KeyCode::Char('+') | KeyCode::Char('='), _) => self.resize_panes(5),
             (KeyCode::Char('/'), _) => self.begin_input(InputMode::Search),
             (KeyCode::Char(':'), _) => self.begin_input(InputMode::Jump),
             (KeyCode::Char('n'), _) => self.next_match(1),
@@ -373,10 +382,62 @@ impl App {
         self.should_quit = true;
     }
 
-    fn handle_mouse(&mut self, kind: MouseEventKind) {
-        match kind {
+    pub fn tree_pane_width(&self, total_width: u16) -> u16 {
+        if total_width <= 1 {
+            return total_width;
+        }
+
+        let maximum = total_width.saturating_sub(MIN_PANE_WIDTH).max(1);
+        let minimum = MIN_PANE_WIDTH.min(maximum);
+        let preferred = (u32::from(total_width) * u32::from(self.pane_split_percent) / 100) as u16;
+        preferred.clamp(minimum, maximum)
+    }
+
+    pub fn is_dragging_divider(&self) -> bool {
+        self.dragging_divider
+    }
+
+    fn resize_panes(&mut self, percentage_points: i16) {
+        self.pane_split_percent =
+            (self.pane_split_percent as i16 + percentage_points).clamp(1, 99) as u16;
+    }
+
+    fn resize_to_column(&mut self, column: u16, body: Rect) {
+        if body.width <= 1 {
+            return;
+        }
+
+        let desired_width = column.saturating_sub(body.x).saturating_add(1);
+        let maximum = body.width.saturating_sub(MIN_PANE_WIDTH).max(1);
+        let minimum = MIN_PANE_WIDTH.min(maximum);
+        let width = desired_width.clamp(minimum, maximum);
+        self.pane_split_percent = ((u32::from(width) * 100 + u32::from(body.width) / 2)
+            / u32::from(body.width))
+        .clamp(1, 99) as u16;
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, body: Rect) {
+        match mouse.kind {
             MouseEventKind::ScrollUp => self.move_by(-3),
             MouseEventKind::ScrollDown => self.move_by(3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let divider = body
+                    .x
+                    .saturating_add(self.tree_pane_width(body.width))
+                    .saturating_sub(1);
+                let over_body = mouse.row >= body.y && mouse.row < body.bottom();
+                if over_body && mouse.column.abs_diff(divider) <= 1 {
+                    self.dragging_divider = true;
+                    self.resize_to_column(mouse.column, body);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
+                self.resize_to_column(mouse.column, body);
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.dragging_divider => {
+                self.resize_to_column(mouse.column, body);
+                self.dragging_divider = false;
+            }
             _ => {}
         }
     }
@@ -395,7 +456,11 @@ pub fn run(app: &mut App) -> Result<()> {
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) => app.handle_key(key),
-                Event::Mouse(mouse) => app.handle_mouse(mouse.kind),
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    app.handle_mouse(mouse, ui::body_area(area));
+                }
                 Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }
         }
@@ -433,11 +498,20 @@ fn terminal_output() -> io::Result<Box<dyn Write>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{KeyEvent, MouseEvent};
     use serde_json::json;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     #[test]
@@ -485,5 +559,53 @@ mod tests {
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.output.as_deref(), Some("{\n  \"b\": 1\n}"));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn pane_width_uses_default_split_and_preserves_minimums() {
+        let app = App::new(json!({}), "test".into(), 1);
+
+        assert_eq!(app.tree_pane_width(100), 58);
+        assert_eq!(app.tree_pane_width(40), 20);
+        assert_eq!(app.tree_pane_width(30), 10);
+    }
+
+    #[test]
+    fn divider_drag_resizes_and_clamps_the_panes() {
+        let mut app = App::new(json!({}), "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 20);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 57, 10), body);
+        assert!(app.is_dragging_divider());
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 74, 10), body);
+        assert_eq!(app.tree_pane_width(body.width), 75);
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 99, 10), body);
+        assert!(!app.is_dragging_divider());
+        assert_eq!(app.tree_pane_width(body.width), 80);
+    }
+
+    #[test]
+    fn divider_only_starts_dragging_from_the_body_separator() {
+        let mut app = App::new(json!({}), "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 20);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 10), body);
+        assert!(!app.is_dragging_divider());
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 57, 1), body);
+        assert!(!app.is_dragging_divider());
+    }
+
+    #[test]
+    fn keyboard_shortcuts_resize_the_panes() {
+        let mut app = App::new(json!({}), "test".into(), 1);
+
+        app.handle_key(key(KeyCode::Char('-')));
+        assert_eq!(app.tree_pane_width(100), 53);
+
+        app.handle_key(key(KeyCode::Char('+')));
+        assert_eq!(app.tree_pane_width(100), 58);
     }
 }

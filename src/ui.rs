@@ -20,14 +20,7 @@ const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(2),
-        ])
-        .split(frame.area());
+    let chunks = page_areas(frame.area());
 
     draw_header(frame, app, chunks[0]);
     draw_body(frame, app, chunks[1]);
@@ -36,6 +29,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.show_help {
         draw_help(frame);
     }
+}
+
+fn page_areas(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(2),
+        ])
+        .split(area)
+}
+
+pub(crate) fn body_area(area: Rect) -> Rect {
+    page_areas(area)[1]
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -64,7 +72,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([
+            Constraint::Length(app.tree_pane_width(area.width)),
+            Constraint::Min(0),
+        ])
         .split(area);
     draw_tree(frame, app, columns[0]);
     draw_preview(frame, app, columns[1]);
@@ -78,11 +89,16 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(app.selected_visible_index()));
     let list = List::new(items)
-        .block(Block::default().borders(Borders::RIGHT).title(format!(
-            " Tree  {}/{} ",
-            app.visible.len(),
-            app.tree.len()
-        )))
+        .block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(if app.is_dragging_divider() {
+                    Style::default().fg(ACCENT)
+                } else {
+                    Style::default().fg(MUTED)
+                })
+                .title(format!(" Tree  {}/{} ", app.visible.len(), app.tree.len())),
+        )
         .highlight_style(Style::default().bg(Color::Rgb(34, 50, 60)).fg(Color::White))
         .highlight_symbol("▌");
     frame.render_stateful_widget(list, area, &mut state);
@@ -244,8 +260,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         lines[0],
     );
     frame.render_widget(
-        Paragraph::new("↑↓/jk move   ←→/hl structure   / search   : path   p print   ? help")
-            .style(Style::default().fg(MUTED)),
+        Paragraph::new(
+            "↑↓/jk move   ←→/hl structure   -/+ resize   / search   : path   p print   ? help",
+        )
+        .style(Style::default().fg(MUTED)),
         lines[1],
     );
 
@@ -259,7 +277,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let area = centered_rect(68, 24, frame.area());
+    let area = centered_rect(68, 26, frame.area());
     frame.render_widget(Clear, area);
     let help = vec![
         Line::from(Span::styled("Navigate", Style::default().fg(ACCENT).bold())),
@@ -285,6 +303,8 @@ fn draw_help(frame: &mut Frame) {
         )),
         Line::from("  Space/Enter     expand or collapse"),
         Line::from("  e/c             expand / collapse the entire branch"),
+        Line::from("  -/+             resize the tree and value panes"),
+        Line::from("  Mouse drag      resize using the pane divider"),
         Line::from("  Esc             clear the active search"),
         Line::from("  p / P           print selected value / path and quit"),
         Line::from("  q, Ctrl-c       quit"),

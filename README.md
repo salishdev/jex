@@ -39,6 +39,9 @@ The left pane is the document tree. The right pane shows the complete JSON value
 | `Ctrl-u` / `Ctrl-d` | Move up / down by a page |
 | `Space` / `Enter` | Toggle the selected container |
 | `e` / `c` | Expand / collapse the whole selected branch |
+| `-` / `+` | Shrink / grow the tree pane |
+
+You can also drag the divider between the tree and value panes with the mouse. Both panes retain a minimum usable width.
 
 ## Finding and returning
 
