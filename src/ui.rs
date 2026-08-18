@@ -14,6 +14,7 @@ use crate::{
     app::{App, InputMode},
     tree::{NodeId, NodeKind},
 };
+use serde_json::Value;
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
@@ -128,9 +129,7 @@ fn tree_item(app: &App, id: NodeId) -> ListItem<'static> {
 
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     let value = app.tree.value_at(app.selected);
-    let content = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-    let preview = Paragraph::new(Text::from(content))
-        .style(Style::default().fg(Color::Gray))
+    let preview = Paragraph::new(highlight_json(value))
         .block(
             Block::default()
                 .title(format!(
@@ -147,6 +146,70 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
             horizontal: 1,
         }),
     );
+}
+
+fn highlight_json(value: &Value) -> Text<'static> {
+    let mut lines = vec![Vec::new()];
+    push_json(value, 0, &mut lines);
+    Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+}
+
+fn push_json(value: &Value, depth: usize, lines: &mut Vec<Vec<Span<'static>>>) {
+    match value {
+        Value::Object(map) if map.is_empty() => push_span(lines, "{}", punctuation_style()),
+        Value::Object(map) => {
+            push_span(lines, "{", punctuation_style());
+            let last = map.len() - 1;
+            for (index, (key, value)) in map.iter().enumerate() {
+                lines.push(vec![Span::raw("  ".repeat(depth + 1))]);
+                push_span(
+                    lines,
+                    serde_json::to_string(key).expect("JSON object keys are serializable"),
+                    Style::default().fg(ACCENT),
+                );
+                push_span(lines, ": ", punctuation_style());
+                push_json(value, depth + 1, lines);
+                if index != last {
+                    push_span(lines, ",", punctuation_style());
+                }
+            }
+            lines.push(vec![Span::raw("  ".repeat(depth))]);
+            push_span(lines, "}", punctuation_style());
+        }
+        Value::Array(items) if items.is_empty() => push_span(lines, "[]", punctuation_style()),
+        Value::Array(items) => {
+            push_span(lines, "[", punctuation_style());
+            let last = items.len() - 1;
+            for (index, value) in items.iter().enumerate() {
+                lines.push(vec![Span::raw("  ".repeat(depth + 1))]);
+                push_json(value, depth + 1, lines);
+                if index != last {
+                    push_span(lines, ",", punctuation_style());
+                }
+            }
+            lines.push(vec![Span::raw("  ".repeat(depth))]);
+            push_span(lines, "]", punctuation_style());
+        }
+        Value::String(value) => push_span(
+            lines,
+            serde_json::to_string(value).expect("JSON strings are serializable"),
+            kind_style(NodeKind::String),
+        ),
+        Value::Number(value) => push_span(lines, value.to_string(), kind_style(NodeKind::Number)),
+        Value::Bool(value) => push_span(lines, value.to_string(), kind_style(NodeKind::Bool)),
+        Value::Null => push_span(lines, "null", kind_style(NodeKind::Null)),
+    }
+}
+
+fn push_span(lines: &mut [Vec<Span<'static>>], content: impl Into<String>, style: Style) {
+    lines
+        .last_mut()
+        .expect("JSON output always has a current line")
+        .push(Span::styled(content.into(), style));
+}
+
+fn punctuation_style() -> Style {
+    Style::default().fg(Color::Gray)
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -265,4 +328,49 @@ fn kind_style(kind: NodeKind) -> Style {
         NodeKind::Null => MUTED,
     };
     Style::default().fg(color)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn highlighted_json_preserves_pretty_printed_content() {
+        let value = json!({"name": "Ada\nLovelace", "active": true, "score": 42, "other": null});
+        let text = highlight_json(&value);
+        let rendered = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(rendered, serde_json::to_string_pretty(&value).unwrap());
+    }
+
+    #[test]
+    fn highlighted_json_styles_each_token_kind() {
+        let text =
+            highlight_json(&json!({"text": "hello", "number": 7, "bool": false, "nil": null}));
+        let spans = text.lines.iter().flat_map(|line| &line.spans);
+        let style_for = |needle: &str| {
+            spans
+                .clone()
+                .find(|span| span.content == needle)
+                .and_then(|span| span.style.fg)
+        };
+
+        assert_eq!(style_for("\"text\""), Some(ACCENT));
+        assert_eq!(style_for("\"hello\""), Some(Color::Green));
+        assert_eq!(style_for("7"), Some(Color::Magenta));
+        assert_eq!(style_for("false"), Some(Color::Yellow));
+        assert_eq!(style_for("null"), Some(MUTED));
+        assert_eq!(style_for("{"), Some(Color::Gray));
+    }
 }
