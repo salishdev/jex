@@ -1,0 +1,22 @@
+{
+  "project": "jex",
+  "contributors": [
+    {
+      "name": "Ada",
+      "roles": ["design", "engineering"],
+      "active": true
+    },
+    {
+      "name": "Linus",
+      "roles": ["engineering"],
+      "active": false
+    }
+  ],
+  "settings": {
+    "theme": "midnight",
+    "navigation": {
+      "wrap": false,
+      "page_size": 10
+    }
+  }
+}

@@ -1,0 +1,489 @@
+use std::{
+    io::{self, Write},
+    time::Duration,
+};
+
+use anyhow::Result;
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{Terminal, backend::CrosstermBackend};
+use serde_json::Value;
+
+use crate::{
+    tree::{JsonTree, NodeId},
+    ui,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputMode {
+    Normal,
+    Search,
+    Jump,
+}
+
+pub struct App {
+    pub tree: JsonTree,
+    pub source: String,
+    pub selected: NodeId,
+    pub visible: Vec<NodeId>,
+    pub input_mode: InputMode,
+    pub input: String,
+    pub search_query: Option<String>,
+    pub matches: Vec<NodeId>,
+    pub match_index: Option<usize>,
+    pub bookmark: Option<NodeId>,
+    pub message: Option<String>,
+    pub show_help: bool,
+    pub output: Option<String>,
+    should_quit: bool,
+    history: Vec<NodeId>,
+    history_index: usize,
+}
+
+impl App {
+    pub fn new(value: Value, source: String, expand_depth: usize) -> Self {
+        let tree = JsonTree::new(value, expand_depth);
+        let visible = tree.visible();
+        Self {
+            tree,
+            source,
+            selected: 0,
+            visible,
+            input_mode: InputMode::Normal,
+            input: String::new(),
+            search_query: None,
+            matches: Vec::new(),
+            match_index: None,
+            bookmark: None,
+            message: None,
+            show_help: false,
+            output: None,
+            should_quit: false,
+            history: vec![0],
+            history_index: 0,
+        }
+    }
+
+    pub fn selected_visible_index(&self) -> usize {
+        self.visible
+            .iter()
+            .position(|&id| id == self.selected)
+            .unwrap_or(0)
+    }
+
+    fn refresh_visible(&mut self) {
+        self.visible = self.tree.visible();
+        if !self.visible.contains(&self.selected) {
+            self.selected = self.visible.first().copied().unwrap_or(0);
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+
+        match self.input_mode {
+            InputMode::Normal => self.handle_normal_key(key),
+            InputMode::Search | InputMode::Jump => self.handle_input_key(key),
+        }
+    }
+
+    fn handle_normal_key(&mut self, key: KeyEvent) {
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+
+        self.message = None;
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => self.should_quit = true,
+            (KeyCode::Char('p'), _) => self.print_value_and_quit(),
+            (KeyCode::Char('P'), _) => {
+                self.output = Some(self.tree.path(self.selected));
+                self.should_quit = true;
+            }
+            (KeyCode::Char('?'), _) => self.show_help = true,
+            (KeyCode::Up | KeyCode::Char('k'), _) => self.move_by(-1),
+            (KeyCode::Down | KeyCode::Char('j'), _) => self.move_by(1),
+            (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                self.move_page(-1)
+            }
+            (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                self.move_page(1)
+            }
+            (KeyCode::Home | KeyCode::Char('g'), _) => self.move_to_visible_edge(false),
+            (KeyCode::End | KeyCode::Char('G'), _) => self.move_to_visible_edge(true),
+            (KeyCode::Left | KeyCode::Char('h'), _) => self.move_left(),
+            (KeyCode::Right | KeyCode::Char('l'), _) => self.move_right(),
+            (KeyCode::Enter | KeyCode::Char(' '), _) => self.toggle_current(),
+            (KeyCode::Char('['), _) => self.move_sibling(-1),
+            (KeyCode::Char(']'), _) => self.move_sibling(1),
+            (KeyCode::Char('e'), _) => {
+                self.tree.expand_descendants(self.selected);
+                self.refresh_visible();
+            }
+            (KeyCode::Char('c'), _) => {
+                self.tree.node_mut(self.selected).expanded = false;
+                self.tree.collapse_descendants(self.selected);
+                self.refresh_visible();
+            }
+            (KeyCode::Char('/'), _) => self.begin_input(InputMode::Search),
+            (KeyCode::Char(':'), _) => self.begin_input(InputMode::Jump),
+            (KeyCode::Char('n'), _) => self.next_match(1),
+            (KeyCode::Char('N'), _) => self.next_match(-1),
+            (KeyCode::Char('b'), _) => self.history_back(),
+            (KeyCode::Char('f'), _) => self.history_forward(),
+            (KeyCode::Char('m'), _) => {
+                self.bookmark = Some(self.selected);
+                self.message = Some(format!("Marked {}", self.tree.path(self.selected)));
+            }
+            (KeyCode::Char('\''), _) => self.return_to_bookmark(),
+            (KeyCode::Esc, _) => {
+                self.search_query = None;
+                self.matches.clear();
+                self.match_index = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.input.clear();
+            }
+            KeyCode::Enter => {
+                let mode = self.input_mode;
+                self.input_mode = InputMode::Normal;
+                match mode {
+                    InputMode::Search => self.submit_search(),
+                    InputMode::Jump => self.submit_jump(),
+                    InputMode::Normal => {}
+                }
+                self.input.clear();
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    fn begin_input(&mut self, mode: InputMode) {
+        self.input_mode = mode;
+        self.input = if mode == InputMode::Search {
+            self.search_query.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+    }
+
+    fn move_by(&mut self, amount: isize) {
+        let current = self.selected_visible_index() as isize;
+        let last = self.visible.len().saturating_sub(1) as isize;
+        let next = (current + amount).clamp(0, last) as usize;
+        self.selected = self.visible[next];
+    }
+
+    fn move_page(&mut self, direction: isize) {
+        // A stable step works predictably across small and large terminals; the list renderer
+        // keeps the new selection on screen.
+        self.move_by(direction * 10);
+    }
+
+    fn move_to_visible_edge(&mut self, end: bool) {
+        if let Some(&id) = if end {
+            self.visible.last()
+        } else {
+            self.visible.first()
+        } {
+            self.selected = id;
+        }
+    }
+
+    fn move_left(&mut self) {
+        let node = self.tree.node(self.selected);
+        if node.expanded && !node.children.is_empty() {
+            self.tree.node_mut(self.selected).expanded = false;
+            self.refresh_visible();
+        } else if let Some(parent) = node.parent {
+            self.selected = parent;
+        }
+    }
+
+    fn move_right(&mut self) {
+        let node = self.tree.node(self.selected);
+        if node.children.is_empty() {
+            return;
+        }
+        if !node.expanded {
+            self.tree.node_mut(self.selected).expanded = true;
+            self.refresh_visible();
+        } else {
+            self.selected = node.children[0];
+        }
+    }
+
+    fn toggle_current(&mut self) {
+        if self.tree.node(self.selected).children.is_empty() {
+            return;
+        }
+        let expanded = self.tree.node(self.selected).expanded;
+        self.tree.node_mut(self.selected).expanded = !expanded;
+        self.refresh_visible();
+    }
+
+    fn move_sibling(&mut self, direction: isize) {
+        let Some(parent) = self.tree.node(self.selected).parent else {
+            return;
+        };
+        let siblings = &self.tree.node(parent).children;
+        let Some(index) = siblings.iter().position(|&id| id == self.selected) else {
+            return;
+        };
+        let last = siblings.len().saturating_sub(1) as isize;
+        let next = (index as isize + direction).clamp(0, last) as usize;
+        self.selected = siblings[next];
+    }
+
+    fn submit_search(&mut self) {
+        let query = self.input.trim().to_lowercase();
+        if query.is_empty() {
+            self.search_query = None;
+            self.matches.clear();
+            self.match_index = None;
+            return;
+        }
+        self.search_query = Some(query.clone());
+        self.matches = (0..self.tree.len())
+            .filter(|&id| self.tree.searchable_text(id).contains(&query))
+            .collect();
+        if self.matches.is_empty() {
+            self.match_index = None;
+            self.message = Some(format!("No matches for {query:?}"));
+            return;
+        }
+        let index = self
+            .matches
+            .iter()
+            .position(|&id| id > self.selected)
+            .unwrap_or(0);
+        self.visit_match(index);
+    }
+
+    fn next_match(&mut self, direction: isize) {
+        if self.matches.is_empty() {
+            self.message = Some("Start a search with /".into());
+            return;
+        }
+        let current = self.match_index.unwrap_or(0) as isize;
+        let len = self.matches.len() as isize;
+        let next = (current + direction).rem_euclid(len) as usize;
+        self.visit_match(next);
+    }
+
+    fn visit_match(&mut self, index: usize) {
+        let target = self.matches[index];
+        self.match_index = Some(index);
+        self.jump_to(target);
+    }
+
+    fn submit_jump(&mut self) {
+        let pointer = self.input.trim();
+        match self.tree.find_pointer(pointer) {
+            Some(id) => self.jump_to(id),
+            None => self.message = Some(format!("Path not found: {pointer}")),
+        }
+    }
+
+    fn jump_to(&mut self, target: NodeId) {
+        if target == self.selected {
+            self.tree.reveal(target);
+            self.refresh_visible();
+            return;
+        }
+        self.remember_current_location();
+        self.history.truncate(self.history_index + 1);
+        self.history.push(target);
+        self.history_index = self.history.len() - 1;
+        self.tree.reveal(target);
+        self.refresh_visible();
+        self.selected = target;
+    }
+
+    fn remember_current_location(&mut self) {
+        if self.history.get(self.history_index).copied() != Some(self.selected) {
+            self.history.truncate(self.history_index + 1);
+            self.history.push(self.selected);
+            self.history_index = self.history.len() - 1;
+        }
+    }
+
+    fn history_back(&mut self) {
+        if self.history_index == 0 {
+            self.message = Some("No earlier location".into());
+            return;
+        }
+        self.history_index -= 1;
+        self.restore_history_location();
+    }
+
+    fn history_forward(&mut self) {
+        if self.history_index + 1 >= self.history.len() {
+            self.message = Some("No later location".into());
+            return;
+        }
+        self.history_index += 1;
+        self.restore_history_location();
+    }
+
+    fn restore_history_location(&mut self) {
+        let target = self.history[self.history_index];
+        self.tree.reveal(target);
+        self.refresh_visible();
+        self.selected = target;
+    }
+
+    fn return_to_bookmark(&mut self) {
+        match self.bookmark {
+            Some(id) => self.jump_to(id),
+            None => self.message = Some("No mark set; press m to set one".into()),
+        }
+    }
+
+    fn print_value_and_quit(&mut self) {
+        let value = self.tree.value_at(self.selected);
+        self.output =
+            Some(serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
+        self.should_quit = true;
+    }
+
+    fn handle_mouse(&mut self, kind: MouseEventKind) {
+        match kind {
+            MouseEventKind::ScrollUp => self.move_by(-3),
+            MouseEventKind::ScrollDown => self.move_by(3),
+            _ => {}
+        }
+    }
+}
+
+pub fn run(app: &mut App) -> Result<()> {
+    enable_raw_mode()?;
+    let guard = TerminalGuard;
+    let mut output = terminal_output()?;
+    execute!(output, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(output);
+    let mut terminal = Terminal::new(backend)?;
+
+    while !app.should_quit {
+        terminal.draw(|frame| ui::draw(frame, app))?;
+        if event::poll(Duration::from_millis(250))? {
+            match event::read()? {
+                Event::Key(key) => app.handle_key(key),
+                Event::Mouse(mouse) => app.handle_mouse(mouse.kind),
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+            }
+        }
+    }
+
+    drop(terminal);
+    drop(guard);
+    Ok(())
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        if let Ok(mut output) = terminal_output() {
+            let _ = execute!(output, LeaveAlternateScreen, DisableMouseCapture);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminal_output() -> io::Result<Box<dyn Write>> {
+    use std::fs::OpenOptions;
+
+    let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    Ok(Box::new(tty))
+}
+
+#[cfg(not(unix))]
+fn terminal_output() -> io::Result<Box<dyn Write>> {
+    Ok(Box::new(io::stdout()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+    use serde_json::json;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn structural_navigation_works_when_children_are_hidden() {
+        let mut app = App::new(json!({"a": {"b": 1}, "c": 2}), "test".into(), 1);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.tree.path(app.selected), "/a");
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.tree.path(app.selected), "/a/b");
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.tree.path(app.selected), "/a");
+    }
+
+    #[test]
+    fn search_reveals_hidden_match_and_cycles() {
+        let mut app = App::new(json!({"a": {"needle": 1}, "needle2": 2}), "test".into(), 0);
+        app.input = "needle".into();
+        app.input_mode = InputMode::Search;
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.tree.path(app.selected), "/a/needle");
+        assert!(app.visible.contains(&app.selected));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.tree.path(app.selected), "/needle2");
+    }
+
+    #[test]
+    fn pointer_jump_and_history_restore_locations() {
+        let mut app = App::new(json!({"a": 1, "b": 2}), "test".into(), 1);
+        app.selected = app.tree.find_pointer("/a").unwrap();
+        app.input = "/b".into();
+        app.input_mode = InputMode::Jump;
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.tree.path(app.selected), "/b");
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.tree.path(app.selected), "/a");
+        app.handle_key(key(KeyCode::Char('f')));
+        assert_eq!(app.tree.path(app.selected), "/b");
+    }
+
+    #[test]
+    fn print_emits_only_the_selected_subtree() {
+        let mut app = App::new(json!({"a": {"b": 1}, "c": 2}), "test".into(), 1);
+        app.selected = app.tree.find_pointer("/a").unwrap();
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.output.as_deref(), Some("{\n  \"b\": 1\n}"));
+        assert!(app.should_quit);
+    }
+}
