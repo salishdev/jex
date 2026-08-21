@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -17,6 +18,7 @@ use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use serde_json::Value;
 
 use crate::{
+    filter,
     tree::{JsonTree, NodeId},
     ui,
 };
@@ -26,6 +28,7 @@ pub enum InputMode {
     Normal,
     Search,
     Jump,
+    Filter,
 }
 
 const DEFAULT_TREE_PANE_PERCENT: u16 = 58;
@@ -35,10 +38,14 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 pub struct App {
     pub tree: JsonTree,
     pub source: String,
+    source_value: Arc<Value>,
     pub selected: NodeId,
     pub visible: Vec<NodeId>,
     pub input_mode: InputMode,
     pub input: String,
+    pub input_cursor: usize,
+    pub active_filter: Option<String>,
+    pub filter_output_count: Option<usize>,
     pub search_query: Option<String>,
     pub matches: Vec<NodeId>,
     match_set: HashSet<NodeId>,
@@ -55,20 +62,26 @@ pub struct App {
     history: Vec<NodeId>,
     history_index: usize,
     visible_positions: HashMap<NodeId, usize>,
+    expand_depth: usize,
 }
 
 impl App {
     pub fn new(value: Value, source: String, expand_depth: usize) -> Self {
-        let tree = JsonTree::new(value, expand_depth);
+        let source_value = Arc::new(value);
+        let tree = JsonTree::from_shared(Arc::clone(&source_value), expand_depth);
         let visible = tree.visible();
         let visible_positions = Self::index_visible_nodes(&visible);
         Self {
             tree,
             source,
+            source_value,
             selected: 0,
             visible,
             input_mode: InputMode::Normal,
             input: String::new(),
+            input_cursor: 0,
+            active_filter: None,
+            filter_output_count: None,
             search_query: None,
             matches: Vec::new(),
             match_set: HashSet::new(),
@@ -85,6 +98,7 @@ impl App {
             history: vec![0],
             history_index: 0,
             visible_positions,
+            expand_depth,
         }
     }
 
@@ -127,7 +141,7 @@ impl App {
         let selected_before = self.selected;
         match self.input_mode {
             InputMode::Normal => self.handle_normal_key(key),
-            InputMode::Search | InputMode::Jump => self.handle_input_key(key),
+            InputMode::Search | InputMode::Jump | InputMode::Filter => self.handle_input_key(key),
         }
         if self.selected != selected_before {
             self.preview_scroll = 0;
@@ -177,6 +191,7 @@ impl App {
             (KeyCode::Char('+') | KeyCode::Char('='), _) => self.resize_panes(5),
             (KeyCode::Char('/'), _) => self.begin_input(InputMode::Search),
             (KeyCode::Char(':'), _) => self.begin_input(InputMode::Jump),
+            (KeyCode::Char('|'), _) => self.begin_input(InputMode::Filter),
             (KeyCode::Char('n'), _) => self.next_match(1),
             (KeyCode::Char('N'), _) => self.next_match(-1),
             (KeyCode::Char('b'), _) => self.history_back(),
@@ -187,10 +202,11 @@ impl App {
             }
             (KeyCode::Char('\''), _) => self.return_to_bookmark(),
             (KeyCode::Esc, _) => {
-                self.search_query = None;
-                self.matches.clear();
-                self.match_set.clear();
-                self.match_index = None;
+                if self.search_query.is_some() {
+                    self.clear_search();
+                } else if self.active_filter.is_some() {
+                    self.clear_filter();
+                }
             }
             _ => {}
         }
@@ -201,22 +217,63 @@ impl App {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
                 self.input.clear();
+                self.input_cursor = 0;
+                self.message = None;
             }
             KeyCode::Enter => {
                 let mode = self.input_mode;
-                self.input_mode = InputMode::Normal;
-                match mode {
-                    InputMode::Search => self.submit_search(),
-                    InputMode::Jump => self.submit_jump(),
-                    InputMode::Normal => {}
+                let accepted = match mode {
+                    InputMode::Search => {
+                        self.submit_search();
+                        true
+                    }
+                    InputMode::Jump => {
+                        self.submit_jump();
+                        true
+                    }
+                    InputMode::Filter => self.submit_filter(),
+                    InputMode::Normal => true,
+                };
+                if accepted {
+                    self.input_mode = InputMode::Normal;
+                    self.input.clear();
+                    self.input_cursor = 0;
                 }
-                self.input.clear();
             }
             KeyCode::Backspace => {
-                self.input.pop();
+                self.message = None;
+                self.remove_before_cursor();
+            }
+            KeyCode::Delete => {
+                self.message = None;
+                self.remove_at_cursor();
+            }
+            KeyCode::Left => self.input_cursor = self.input_cursor.saturating_sub(1),
+            KeyCode::Right => {
+                self.input_cursor = (self.input_cursor + 1).min(self.input.chars().count())
+            }
+            KeyCode::Home => self.input_cursor = 0,
+            KeyCode::End => self.input_cursor = self.input.chars().count(),
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input_cursor = 0
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input_cursor = self.input.chars().count()
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.message = None;
+                self.input.clear();
+                self.input_cursor = 0;
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.message = None;
+                self.remove_previous_word()
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.push(ch);
+                self.message = None;
+                let byte = char_to_byte(&self.input, self.input_cursor);
+                self.input.insert(byte, ch);
+                self.input_cursor += 1;
             }
             _ => {}
         }
@@ -224,11 +281,48 @@ impl App {
 
     fn begin_input(&mut self, mode: InputMode) {
         self.input_mode = mode;
-        self.input = if mode == InputMode::Search {
-            self.search_query.clone().unwrap_or_default()
-        } else {
-            String::new()
+        self.input = match mode {
+            InputMode::Search => self.search_query.clone().unwrap_or_default(),
+            InputMode::Filter => self.active_filter.clone().unwrap_or_default(),
+            InputMode::Jump | InputMode::Normal => String::new(),
         };
+        self.input_cursor = self.input.chars().count();
+    }
+
+    fn remove_before_cursor(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let start = char_to_byte(&self.input, self.input_cursor - 1);
+        let end = char_to_byte(&self.input, self.input_cursor);
+        self.input.replace_range(start..end, "");
+        self.input_cursor -= 1;
+    }
+
+    fn remove_at_cursor(&mut self) {
+        if self.input_cursor == self.input.chars().count() {
+            return;
+        }
+        let start = char_to_byte(&self.input, self.input_cursor);
+        let end = char_to_byte(&self.input, self.input_cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn remove_previous_word(&mut self) {
+        while self.input_cursor > 0 {
+            let previous = self.input.chars().nth(self.input_cursor - 1);
+            if previous.is_some_and(|ch| !ch.is_whitespace()) {
+                break;
+            }
+            self.remove_before_cursor();
+        }
+        while self.input_cursor > 0 {
+            let previous = self.input.chars().nth(self.input_cursor - 1);
+            if previous.is_some_and(char::is_whitespace) {
+                break;
+            }
+            self.remove_before_cursor();
+        }
     }
 
     fn move_by(&mut self, amount: isize) {
@@ -322,6 +416,58 @@ impl App {
             .position(|&id| id > self.selected)
             .unwrap_or(0);
         self.visit_match(index);
+    }
+
+    fn clear_search(&mut self) {
+        self.search_query = None;
+        self.matches.clear();
+        self.match_set.clear();
+        self.match_index = None;
+    }
+
+    fn submit_filter(&mut self) -> bool {
+        let expression = self.input.trim().to_owned();
+        if expression.is_empty() {
+            self.clear_filter();
+            return true;
+        }
+
+        match filter::evaluate(&self.source_value, &expression) {
+            Ok(output) => {
+                let count = output.count;
+                self.replace_tree(Arc::new(output.value));
+                self.active_filter = Some(expression);
+                self.filter_output_count = Some(count);
+                self.message = Some(format!(
+                    "Filter applied · {count} {}",
+                    if count == 1 { "output" } else { "outputs" }
+                ));
+                true
+            }
+            Err(error) => {
+                self.message = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    fn clear_filter(&mut self) {
+        self.replace_tree(Arc::clone(&self.source_value));
+        self.active_filter = None;
+        self.filter_output_count = None;
+        self.message = Some("Filter cleared".into());
+    }
+
+    fn replace_tree(&mut self, value: Arc<Value>) {
+        self.tree = JsonTree::from_shared(value, self.expand_depth);
+        self.selected = 0;
+        self.visible = self.tree.visible();
+        self.visible_positions = Self::index_visible_nodes(&self.visible);
+        self.clear_search();
+        self.bookmark = None;
+        self.preview_scroll = 0;
+        self.history = vec![0];
+        self.history_index = 0;
     }
 
     fn next_match(&mut self, direction: isize) {
@@ -564,6 +710,13 @@ impl App {
     }
 }
 
+fn char_to_byte(text: &str, character: usize) -> usize {
+    text.char_indices()
+        .nth(character)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
 pub fn run(app: &mut App) -> Result<()> {
     enable_raw_mode()?;
     let guard = TerminalGuard;
@@ -641,6 +794,12 @@ mod tests {
         }
     }
 
+    fn set_input(app: &mut App, input: &str, mode: InputMode) {
+        app.input = input.into();
+        app.input_cursor = input.chars().count();
+        app.input_mode = mode;
+    }
+
     #[test]
     fn structural_navigation_works_when_children_are_hidden() {
         let mut app = App::new(json!({"a": {"b": 1}, "c": 2}), "test".into(), 1);
@@ -656,8 +815,7 @@ mod tests {
     #[test]
     fn search_reveals_hidden_match_and_cycles() {
         let mut app = App::new(json!({"a": {"needle": 1}, "needle2": 2}), "test".into(), 0);
-        app.input = "needle".into();
-        app.input_mode = InputMode::Search;
+        set_input(&mut app, "needle", InputMode::Search);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.tree.path(app.selected), "/a/needle");
         assert!(app.visible.contains(&app.selected));
@@ -670,8 +828,7 @@ mod tests {
     fn pointer_jump_and_history_restore_locations() {
         let mut app = App::new(json!({"a": 1, "b": 2}), "test".into(), 1);
         app.selected = app.tree.find_pointer("/a").unwrap();
-        app.input = "/b".into();
-        app.input_mode = InputMode::Jump;
+        set_input(&mut app, "/b", InputMode::Jump);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.tree.path(app.selected), "/b");
         app.handle_key(key(KeyCode::Char('b')));
@@ -857,5 +1014,97 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('+')));
         assert_eq!(app.tree_pane_width(100), 58);
+    }
+
+    #[test]
+    fn jq_filter_replaces_the_tree_with_navigable_stream_results() {
+        let mut app = App::new(
+            json!({"users": [{"name": "Ada", "active": true}, {"name": "Lin", "active": false}]}),
+            "test".into(),
+            1,
+        );
+        set_input(
+            &mut app,
+            ".users[] | select(.active) | .name",
+            InputMode::Filter,
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(
+            app.active_filter.as_deref(),
+            Some(".users[] | select(.active) | .name")
+        );
+        assert_eq!(app.filter_output_count, Some(1));
+        assert_eq!(app.tree.value_at(0), &json!("Ada"));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn every_jq_filter_runs_against_the_original_document() {
+        let mut app = App::new(json!({"left": [1, 2], "right": [3, 4]}), "test".into(), 1);
+        set_input(&mut app, ".left[]", InputMode::Filter);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.tree.value_at(0), &json!([1, 2]));
+
+        set_input(&mut app, ".right[]", InputMode::Filter);
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.tree.value_at(0), &json!([3, 4]));
+        assert_eq!(app.filter_output_count, Some(2));
+    }
+
+    #[test]
+    fn jq_errors_keep_the_editor_and_previous_tree_open() {
+        let mut app = App::new(json!({"name": "Ada"}), "test".into(), 1);
+        set_input(&mut app, ".[", InputMode::Filter);
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.input_mode, InputMode::Filter);
+        assert_eq!(app.input, ".[");
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|message| message.contains("syntax error"))
+        );
+        assert_eq!(app.tree.value_at(0), &json!({"name": "Ada"}));
+        assert_eq!(app.active_filter, None);
+    }
+
+    #[test]
+    fn escape_clears_search_before_restoring_the_unfiltered_document() {
+        let original = json!({"left": [1, 2], "right": 3});
+        let mut app = App::new(original.clone(), "test".into(), 1);
+        set_input(&mut app, ".left", InputMode::Filter);
+        app.handle_key(key(KeyCode::Enter));
+        set_input(&mut app, "2", InputMode::Search);
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.search_query.is_none());
+        assert!(app.active_filter.is_some());
+        assert_eq!(app.tree.value_at(0), &json!([1, 2]));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.active_filter.is_none());
+        assert_eq!(app.tree.value_at(0), &original);
+    }
+
+    #[test]
+    fn prompt_editing_inserts_and_deletes_at_a_unicode_cursor() {
+        let mut app = App::new(json!(null), "test".into(), 1);
+        set_input(&mut app, "aé", InputMode::Filter);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Char('!')));
+        assert_eq!(app.input, "a!é");
+        assert_eq!(app.input_cursor, 2);
+
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.input, "a!");
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "a");
+        assert_eq!(app.input_cursor, 1);
     }
 }

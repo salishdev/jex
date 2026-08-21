@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde_json::Value;
 
 pub type NodeId = usize;
@@ -34,12 +36,17 @@ pub struct Node {
 
 #[derive(Debug)]
 pub struct JsonTree {
-    value: Value,
+    value: Arc<Value>,
     nodes: Vec<Node>,
 }
 
 impl JsonTree {
+    #[cfg(test)]
     pub fn new(value: Value, expand_depth: usize) -> Self {
+        Self::from_shared(Arc::new(value), expand_depth)
+    }
+
+    pub fn from_shared(value: Arc<Value>, expand_depth: usize) -> Self {
         let mut nodes = Vec::new();
         Self::build_value(&value, &mut nodes, None, None, 0, expand_depth, 0);
         Self { value, nodes }
@@ -149,7 +156,7 @@ impl JsonTree {
             cursor = node.parent;
         }
 
-        let mut value = &self.value;
+        let mut value = self.value.as_ref();
         for segment in segments.into_iter().rev() {
             value = match segment {
                 Segment::Key(key) => &value[key],

@@ -51,7 +51,7 @@ pub(crate) fn body_area(area: Rect) -> Rect {
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let node = app.tree.node(app.selected);
     let path = app.tree.path(app.selected);
-    let header = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(" jex ", Style::default().fg(Color::Black).bg(ACCENT).bold()),
         Span::raw("  "),
         Span::styled(path, Style::default().fg(Color::White).bold()),
@@ -59,15 +59,26 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             format!("  ·  {}  ·  depth {}", node.kind.name(), node.depth),
             Style::default().fg(MUTED),
         ),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .title(Span::styled(
-                format!(" {} ", app.source),
-                Style::default().fg(MUTED),
-            )),
-    );
+    ];
+    if let Some(expression) = &app.active_filter {
+        let count = app.filter_output_count.unwrap_or(0);
+        spans.push(Span::styled("  ·  jq ", Style::default().fg(MUTED)));
+        spans.push(Span::styled(
+            expression.clone(),
+            Style::default().fg(Color::Magenta),
+        ));
+        spans.push(Span::styled(
+            format!(
+                "  ·  {count} {}",
+                if count == 1 { "output" } else { "outputs" }
+            ),
+            Style::default().fg(MUTED),
+        ));
+    }
+    let header =
+        Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::BOTTOM).title(
+            Span::styled(format!(" {} ", app.source), Style::default().fg(MUTED)),
+        ));
     frame.render_widget(header, area);
 }
 
@@ -498,6 +509,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let (prefix, text, style) = match app.input_mode {
         InputMode::Search => ("/", app.input.clone(), Style::default().fg(Color::Yellow)),
         InputMode::Jump => (":", app.input.clone(), Style::default().fg(ACCENT)),
+        InputMode::Filter => ("|", app.input.clone(), Style::default().fg(Color::Magenta)),
         InputMode::Normal => {
             let status = app
                 .message
@@ -513,6 +525,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("", status, Style::default().fg(Color::Yellow))
         }
     };
+    let (text, cursor_column) = if app.input_mode == InputMode::Normal {
+        (text, 0)
+    } else {
+        prompt_view(
+            &text,
+            app.input_cursor,
+            usize::from(lines[0].width.saturating_sub(1)),
+        )
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
@@ -520,16 +541,22 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ])),
         lines[0],
     );
-    frame.render_widget(
-        Paragraph::new(
-            "↑↓/jk move   ←→/hl structure   -/+ resize   / search   : path   p print   ? help",
-        )
-        .style(Style::default().fg(MUTED)),
-        lines[1],
-    );
+    let hint = if app.input_mode == InputMode::Filter {
+        app.message
+            .as_deref()
+            .unwrap_or("Enter apply   Esc cancel   Ctrl-u clear   Ctrl-w erase word")
+    } else {
+        "↑↓/jk move   ←→/hl structure   / search   : path   | jq   p print   ? help"
+    };
+    let hint_style = if app.input_mode == InputMode::Filter && app.message.is_some() {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    frame.render_widget(Paragraph::new(hint).style(hint_style), lines[1]);
 
     if app.input_mode != InputMode::Normal {
-        let cursor_x = lines[0].x + 1 + app.input.chars().count() as u16;
+        let cursor_x = lines[0].x + 1 + cursor_column;
         frame.set_cursor_position(Position::new(
             cursor_x.min(lines[0].right() - 1),
             lines[0].y,
@@ -537,8 +564,38 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn prompt_view(text: &str, cursor: usize, available: usize) -> (String, u16) {
+    if available == 0 {
+        return (String::new(), 0);
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+    let mut start = 0;
+    while start < cursor
+        && text_width(&chars[start..cursor].iter().collect::<String>()) >= available
+    {
+        start += 1;
+    }
+
+    let mut shown = String::new();
+    for &ch in &chars[start..] {
+        let mut candidate = shown.clone();
+        candidate.push(ch);
+        if text_width(&candidate) > available {
+            break;
+        }
+        shown.push(ch);
+    }
+    let before_cursor = chars[start..cursor].iter().collect::<String>();
+    (
+        shown,
+        text_width(&before_cursor).min(usize::from(u16::MAX)) as u16,
+    )
+}
+
 fn draw_help(frame: &mut Frame) {
-    let area = centered_rect(68, 29, frame.area());
+    let area = centered_rect(68, 34, frame.area());
     frame.render_widget(Clear, area);
     let help = vec![
         Line::from(Span::styled("Navigate", Style::default().fg(ACCENT).bold())),
@@ -557,6 +614,14 @@ fn draw_help(frame: &mut Frame) {
         Line::from("  :               jump to JSON Pointer (/users/0/name)"),
         Line::from("  b/f             back / forward through jumps"),
         Line::from("  m / '           set / return to a bookmark"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Filter with jq",
+            Style::default().fg(ACCENT).bold(),
+        )),
+        Line::from("  |               edit a jq-compatible filter"),
+        Line::from("  Enter / Esc     apply / cancel filter editing"),
+        Line::from("  Esc             clear an applied filter (after search)"),
         Line::from(""),
         Line::from(Span::styled(
             "Shape the tree",
@@ -732,5 +797,13 @@ mod tests {
         );
         assert_eq!(breadcrumb_target_at(&app, area, Position::new(23, 5)), None);
         assert_eq!(breadcrumb_target_at(&app, area, Position::new(25, 6)), None);
+    }
+
+    #[test]
+    fn long_filter_prompts_keep_the_cursor_visible() {
+        let (shown, cursor) = prompt_view(".users[] | select(.active)", 27, 12);
+
+        assert_eq!(shown, "ct(.active)");
+        assert_eq!(usize::from(cursor), text_width(&shown));
     }
 }

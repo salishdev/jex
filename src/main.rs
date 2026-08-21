@@ -1,4 +1,5 @@
 mod app;
+mod filter;
 mod tree;
 mod ui;
 

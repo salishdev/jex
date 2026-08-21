@@ -2,7 +2,7 @@
 
 `jex` is a navigation-first terminal JSON explorer. It treats a document as a tree you can move through structurally, so finding your way around a large file does not depend on scrolling through a wall of formatted text.
 
-This initial version deliberately focuses on browsing and extraction. It does not evaluate arbitrary `jq` expressions yet.
+It also embeds a jq-compatible filter engine, so you can narrow or transform a document without leaving the explorer.
 
 ## Run it
 
@@ -52,6 +52,20 @@ You can click a row in the tree to select it, or click its disclosure marker to 
 - `Esc` clears the current search.
 
 JSON Pointer escaping follows RFC 6901: `/` inside an object key becomes `~1`, and `~` becomes `~0`.
+
+## Filtering with jq
+
+Press `|` to edit a jq-compatible expression, then press `Enter` to apply it. Filters always run against the original input document, so editing an applied filter does not create an implicit chain of transformations:
+
+```jq
+.users[] | select(.active) | {name, email}
+```
+
+The filtered value becomes a normal browsable tree. A filter that emits several values displays them as a result array; a filter that emits no values displays an empty array. The header shows the active expression and its output count.
+
+While editing, use the arrow keys, `Home`, `End`, `Delete`, `Ctrl-u`, and `Ctrl-w` for line editing. `Enter` applies the expression and `Esc` cancels the edit. Syntax and runtime errors leave the editor open so you can correct them. In normal mode, `Esc` clears an active search first, then clears an applied filter and restores the original document.
+
+The embedded engine is [jaq](https://github.com/01mf02/jaq), which supports a large jq-compatible language without requiring a separate `jq` installation. Filter output is limited to 10,000 values to protect the interactive UI from unbounded result streams.
 
 ## Extracting a value
 
