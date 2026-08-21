@@ -522,6 +522,10 @@ impl App {
                     self.select_tree_row(mouse, tree_area);
                 } else {
                     self.last_tree_click = None;
+                    let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+                    if let Some(target) = ui::breadcrumb_target_at(self, right_area, position) {
+                        self.jump_to(target);
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
@@ -785,6 +789,24 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 10, 4), body);
         assert_eq!(app.selected_visible_index(), 3);
         assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn clicking_a_breadcrumb_navigates_and_records_history() {
+        let mut app = App::new(json!({"a": {"b": {"c": 1}}}), "test".into(), 0);
+        let body = Rect::new(0, 3, 100, 10);
+        app.selected = app.tree.find_pointer("/a/b/c").unwrap();
+
+        // The right pane starts at x=58, has a one-column inset, and renders
+        // "$ › a" on the breadcrumb row. Click the "a" segment.
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 63, body.y),
+            body,
+        );
+
+        assert_eq!(app.tree.path(app.selected), "/a");
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.tree.path(app.selected), "/a/b/c");
     }
 
     #[test]

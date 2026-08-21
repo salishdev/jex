@@ -27,7 +27,7 @@ Use `--expand-depth N` (or `-d N`) to control how much of the tree is initially 
 
 ## Navigation
 
-The left pane is the document tree. The right pane shows the complete JSON value at the selected node, and the header always shows its JSON Pointer.
+The left pane is the document tree. The right pane shows the complete JSON value at the selected node, with a breadcrumb trail above it. Click any ancestor in the trail to navigate there; breadcrumb jumps are included in back/forward history. The header always shows the selected node's JSON Pointer.
 
 | Key | Action |
 | --- | --- |

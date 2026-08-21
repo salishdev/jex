@@ -18,6 +18,8 @@ use serde_json::Value;
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
+const BREADCRUMB_SEPARATOR: &str = " › ";
+const HIDDEN_BREADCRUMBS: &str = "… › ";
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = page_areas(frame.area());
@@ -155,7 +157,9 @@ fn tree_item(app: &App, id: NodeId) -> ListItem<'static> {
 }
 
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
-    let preview_area = preview_area(area);
+    let (header_area, preview_area) = preview_areas(area);
+    frame.render_widget(preview_header(app, header_area), header_area);
+
     let preview = preview_widget(app);
     let content_height = preview.line_count(preview_area.width);
     let maximum_scroll = content_height.saturating_sub(usize::from(preview_area.height));
@@ -176,27 +180,163 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
 
 fn preview_widget(app: &App) -> Paragraph<'static> {
     let value = app.tree.value_at(app.selected);
-    Paragraph::new(highlight_json(value))
-        .block(
-            Block::default()
-                .title(format!(
-                    " Value · {} ",
-                    app.tree.node(app.selected).kind.name()
-                ))
-                .borders(Borders::NONE),
-        )
-        .wrap(Wrap { trim: false })
+    Paragraph::new(highlight_json(value)).wrap(Wrap { trim: false })
 }
 
-fn preview_area(area: Rect) -> Rect {
-    area.inner(Margin {
+fn preview_areas(area: Rect) -> (Rect, Rect) {
+    let details = area.inner(Margin {
         vertical: 0,
         horizontal: 1,
-    })
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(details);
+    (rows[0], rows[1])
+}
+
+fn preview_header(app: &App, area: Rect) -> Paragraph<'static> {
+    Paragraph::new(breadcrumb_line(app, area.width).0)
+}
+
+struct BreadcrumbTarget {
+    id: NodeId,
+    start: u16,
+    end: u16,
+}
+
+fn breadcrumb_line(app: &App, width: u16) -> (Line<'static>, Vec<BreadcrumbTarget>) {
+    let lineage = app.tree.lineage(app.selected);
+    if lineage.is_empty() || width == 0 {
+        return (Line::default(), Vec::new());
+    }
+
+    let labels = lineage
+        .iter()
+        .map(|&id| {
+            let label = app.tree.label(id);
+            if label.is_empty() {
+                "\"\"".into()
+            } else {
+                label
+            }
+        })
+        .collect::<Vec<_>>();
+    let available = usize::from(width);
+    let full_width = labels.iter().map(|label| text_width(label)).sum::<usize>()
+        + text_width(BREADCRUMB_SEPARATOR) * labels.len().saturating_sub(1);
+
+    let (start, hidden_prefix) = if full_width <= available {
+        (0, false)
+    } else if available <= text_width(HIDDEN_BREADCRUMBS) {
+        (labels.len() - 1, false)
+    } else {
+        let suffix_width = available - text_width(HIDDEN_BREADCRUMBS);
+        let mut start = labels.len() - 1;
+        while start > 0 {
+            let candidate_width = labels[start - 1..]
+                .iter()
+                .map(|label| text_width(label))
+                .sum::<usize>()
+                + text_width(BREADCRUMB_SEPARATOR) * (labels.len() - start);
+            if candidate_width > suffix_width {
+                break;
+            }
+            start -= 1;
+        }
+        (start, true)
+    };
+
+    let mut spans = Vec::new();
+    let mut targets = Vec::new();
+    let mut column = 0usize;
+    if hidden_prefix {
+        spans.push(Span::styled(HIDDEN_BREADCRUMBS, Style::default().fg(MUTED)));
+        column += text_width(HIDDEN_BREADCRUMBS);
+    }
+
+    for (visible_index, index) in (start..labels.len()).enumerate() {
+        if visible_index > 0 {
+            spans.push(Span::styled(
+                BREADCRUMB_SEPARATOR,
+                Style::default().fg(MUTED),
+            ));
+            column += text_width(BREADCRUMB_SEPARATOR);
+        }
+
+        let remaining = available.saturating_sub(column);
+        let label = truncate_to_width(&labels[index], remaining);
+        let label_width = text_width(&label);
+        let is_current = lineage[index] == app.selected;
+        let style = if is_current {
+            Style::default().fg(Color::White).bold()
+        } else {
+            Style::default().fg(ACCENT).underlined()
+        };
+        spans.push(Span::styled(label, style));
+        targets.push(BreadcrumbTarget {
+            id: lineage[index],
+            start: column.min(usize::from(u16::MAX)) as u16,
+            end: column
+                .saturating_add(label_width)
+                .min(usize::from(u16::MAX)) as u16,
+        });
+        column += label_width;
+    }
+
+    (Line::from(spans), targets)
+}
+
+fn text_width(text: &str) -> usize {
+    Span::raw(text.to_owned()).width()
+}
+
+fn truncate_to_width(text: &str, maximum: usize) -> String {
+    if text_width(text) <= maximum {
+        return text.to_owned();
+    }
+    if maximum == 0 {
+        return String::new();
+    }
+    if maximum == 1 {
+        return "…".into();
+    }
+
+    let mut shortened = String::new();
+    let content_width = maximum - 1;
+    let mut used = 0;
+    for ch in text.chars() {
+        let char_width = text_width(&ch.to_string());
+        if used + char_width > content_width {
+            break;
+        }
+        shortened.push(ch);
+        used += char_width;
+    }
+    shortened.push('…');
+    shortened
+}
+
+pub(crate) fn breadcrumb_target_at(app: &App, area: Rect, position: Position) -> Option<NodeId> {
+    let (header, _) = preview_areas(area);
+    if header.height == 0
+        || position.y != header.y
+        || position.x < header.x
+        || position.x >= header.right()
+    {
+        return None;
+    }
+
+    let column = position.x.saturating_sub(header.x);
+    breadcrumb_line(app, header.width)
+        .1
+        .into_iter()
+        .find(|target| column >= target.start && column < target.end)
+        .map(|target| target.id)
 }
 
 pub(crate) fn preview_max_scroll(app: &App, area: Rect) -> u16 {
-    let area = preview_area(area);
+    let (_, area) = preview_areas(area);
     let content_height = preview_widget(app).line_count(area.width);
     content_height
         .saturating_sub(usize::from(area.height))
@@ -343,7 +483,7 @@ fn draw_help(frame: &mut Frame) {
         Line::from("  Space/Enter     expand or collapse"),
         Line::from("  e/c             expand / collapse the entire branch"),
         Line::from("  -/+             resize the tree and value panes"),
-        Line::from("  Mouse click     select a tree row; disclosure toggles it"),
+        Line::from("  Mouse click     select a tree row or navigate a breadcrumb"),
         Line::from("  Double-click    expand or collapse a container row"),
         Line::from("  Mouse wheel     move the tree or scroll the hovered value"),
         Line::from("  Mouse drag      resize using the pane divider"),
@@ -397,6 +537,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn highlighted_json_preserves_pretty_printed_content() {
         let value = json!({"name": "Ada\nLovelace", "active": true, "score": 42, "other": null});
@@ -434,5 +581,32 @@ mod tests {
         assert_eq!(style_for("false"), Some(Color::Yellow));
         assert_eq!(style_for("null"), Some(MUTED));
         assert_eq!(style_for("{"), Some(Color::Gray));
+    }
+
+    #[test]
+    fn breadcrumbs_keep_the_selected_node_visible_in_a_narrow_pane() {
+        let mut app = App::new(json!({"alpha": {"beta": {"gamma": 1}}}), "test".into(), 0);
+        app.selected = app.tree.find_pointer("/alpha/beta/gamma").unwrap();
+
+        let (line, targets) = breadcrumb_line(&app, 10);
+
+        assert_eq!(line_text(&line), "… › gamma");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, app.selected);
+        assert!(line.width() <= 10);
+    }
+
+    #[test]
+    fn breadcrumb_hit_testing_only_selects_labels() {
+        let mut app = App::new(json!({"alpha": {"beta": 1}}), "test".into(), 0);
+        app.selected = app.tree.find_pointer("/alpha/beta").unwrap();
+        let area = Rect::new(20, 5, 40, 10);
+
+        assert_eq!(
+            breadcrumb_target_at(&app, area, Position::new(25, 5)),
+            app.tree.find_pointer("/alpha")
+        );
+        assert_eq!(breadcrumb_target_at(&app, area, Position::new(23, 5)), None);
+        assert_eq!(breadcrumb_target_at(&app, area, Position::new(25, 6)), None);
     }
 }

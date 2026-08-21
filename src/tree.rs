@@ -168,6 +168,17 @@ impl JsonTree {
         }
     }
 
+    pub fn lineage(&self, id: NodeId) -> Vec<NodeId> {
+        let mut lineage = Vec::with_capacity(self.nodes[id].depth + 1);
+        let mut cursor = Some(id);
+        while let Some(node_id) = cursor {
+            lineage.push(node_id);
+            cursor = self.nodes[node_id].parent;
+        }
+        lineage.reverse();
+        lineage
+    }
+
     pub fn find_pointer(&self, pointer: &str) -> Option<NodeId> {
         if pointer == "/" || pointer.is_empty() || pointer == "$" {
             return Some(0);
@@ -320,5 +331,19 @@ mod tests {
         let c = tree.find_pointer("/a/b/c").unwrap();
         tree.reveal(c);
         assert!(tree.visible().contains(&c));
+    }
+
+    #[test]
+    fn lineage_runs_from_root_to_selected_node() {
+        let tree = JsonTree::new(json!({"a": [{"b": 1}]}), 0);
+        let b = tree.find_pointer("/a/0/b").unwrap();
+
+        let labels = tree
+            .lineage(b)
+            .into_iter()
+            .map(|id| tree.label(id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["$", "a", "[0]", "b"]);
     }
 }
