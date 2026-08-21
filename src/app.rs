@@ -96,6 +96,13 @@ struct FilterPreview {
     lines: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScrollbarDrag {
+    Tree { grab_offset: u16 },
+    Preview { grab_offset: u16 },
+    FilterPreview { grab_offset: u16 },
+}
+
 impl FilterPreview {
     fn new(expression: String, output: filter::FilterOutput) -> Self {
         let formatted = serde_json::to_string_pretty(&output.value)
@@ -129,6 +136,8 @@ pub struct App {
     pub show_help: bool,
     pub output: Option<String>,
     pub preview_scroll: usize,
+    tree_scroll: usize,
+    tree_scroll_locked: bool,
     filter_worker: FilterWorker,
     filter_generation: u64,
     filter_preview_deadline: Option<Instant>,
@@ -139,6 +148,7 @@ pub struct App {
     filter_spinner_deadline: Option<Instant>,
     pane_split_percent: u16,
     dragging_divider: bool,
+    scrollbar_drag: Option<ScrollbarDrag>,
     last_tree_click: Option<(NodeId, Instant)>,
     should_quit: bool,
     history: Vec<NodeId>,
@@ -174,6 +184,8 @@ impl App {
             show_help: false,
             output: None,
             preview_scroll: 0,
+            tree_scroll: 0,
+            tree_scroll_locked: false,
             filter_worker,
             filter_generation: 0,
             filter_preview_deadline: None,
@@ -184,6 +196,7 @@ impl App {
             filter_spinner_deadline: None,
             pane_split_percent: DEFAULT_TREE_PANE_PERCENT,
             dragging_divider: false,
+            scrollbar_drag: None,
             last_tree_click: None,
             should_quit: false,
             history: vec![0],
@@ -217,6 +230,7 @@ impl App {
         self.visible_positions = Self::index_visible_nodes(&self.visible);
         if !self.visible_positions.contains_key(&self.selected) {
             self.selected = self.visible.first().copied().unwrap_or(0);
+            self.tree_scroll_locked = false;
         }
     }
 
@@ -236,6 +250,7 @@ impl App {
         }
         if self.selected != selected_before {
             self.preview_scroll = 0;
+            self.tree_scroll_locked = false;
         }
     }
 
@@ -438,6 +453,7 @@ impl App {
     }
 
     fn move_by(&mut self, amount: isize) {
+        self.tree_scroll_locked = false;
         let current = self.selected_visible_index() as isize;
         let last = self.visible.len().saturating_sub(1) as isize;
         let next = (current + amount).clamp(0, last) as usize;
@@ -451,6 +467,7 @@ impl App {
     }
 
     fn move_to_visible_edge(&mut self, end: bool) {
+        self.tree_scroll_locked = false;
         if let Some(&id) = if end {
             self.visible.last()
         } else {
@@ -461,6 +478,7 @@ impl App {
     }
 
     fn move_left(&mut self) {
+        self.tree_scroll_locked = false;
         let node = self.tree.node(self.selected);
         if node.expanded && !node.children.is_empty() {
             self.tree.node_mut(self.selected).expanded = false;
@@ -471,6 +489,7 @@ impl App {
     }
 
     fn move_right(&mut self) {
+        self.tree_scroll_locked = false;
         let node = self.tree.node(self.selected);
         if node.children.is_empty() {
             return;
@@ -493,6 +512,7 @@ impl App {
     }
 
     fn move_sibling(&mut self, direction: isize) {
+        self.tree_scroll_locked = false;
         let Some(parent) = self.tree.node(self.selected).parent else {
             return;
         };
@@ -740,6 +760,8 @@ impl App {
         self.clear_search();
         self.bookmark = None;
         self.preview_scroll = 0;
+        self.tree_scroll = 0;
+        self.tree_scroll_locked = false;
         self.history = vec![0];
         self.history_index = 0;
     }
@@ -770,6 +792,7 @@ impl App {
     }
 
     fn jump_to(&mut self, target: NodeId) {
+        self.tree_scroll_locked = false;
         if target == self.selected {
             self.tree.reveal(target);
             self.refresh_visible();
@@ -815,6 +838,7 @@ impl App {
         self.tree.reveal(target);
         self.refresh_visible();
         self.selected = target;
+        self.tree_scroll_locked = false;
     }
 
     fn return_to_bookmark(&mut self) {
@@ -865,9 +889,21 @@ impl App {
         .clamp(1, 99) as u16;
     }
 
-    fn tree_view_offset(&self, viewport_height: u16) -> usize {
-        self.selected_visible_index()
-            .saturating_sub(usize::from(viewport_height).saturating_sub(1))
+    pub(crate) fn tree_max_scroll(&self, viewport_height: u16) -> usize {
+        self.visible
+            .len()
+            .saturating_sub(usize::from(viewport_height))
+    }
+
+    pub(crate) fn tree_view_offset(&self, viewport_height: u16) -> usize {
+        let maximum = self.tree_max_scroll(viewport_height);
+        if self.tree_scroll_locked {
+            self.tree_scroll.min(maximum)
+        } else {
+            self.selected_visible_index()
+                .saturating_sub(usize::from(viewport_height).saturating_sub(1))
+                .min(maximum)
+        }
     }
 
     fn select_tree_row(&mut self, mouse: MouseEvent, tree_area: Rect) {
@@ -879,7 +915,8 @@ impl App {
         }
 
         let row = usize::from(mouse.row.saturating_sub(items_area.y));
-        let index = self.tree_view_offset(items_area.height).saturating_add(row);
+        let offset = self.tree_view_offset(items_area.height);
+        let index = offset.saturating_add(row);
         let Some(&id) = self.visible.get(index) else {
             self.last_tree_click = None;
             return;
@@ -904,6 +941,8 @@ impl App {
         } else {
             Some((id, now))
         };
+        self.tree_scroll = offset;
+        self.tree_scroll_locked = true;
         let selected_before = self.selected;
         self.selected = id;
         if self.selected != selected_before {
@@ -924,8 +963,71 @@ impl App {
         };
     }
 
+    fn scroll_tree(&mut self, direction: isize, area: Rect) {
+        let viewport_height = ui::tree_items_area(area).height;
+        let maximum = self.tree_max_scroll(viewport_height);
+        let current = self.tree_view_offset(viewport_height);
+        self.tree_scroll = if direction < 0 {
+            current.saturating_sub(direction.unsigned_abs())
+        } else {
+            current.saturating_add(direction as usize).min(maximum)
+        };
+        self.tree_scroll_locked = true;
+    }
+
+    fn drag_scrollbar(&mut self, drag: ScrollbarDrag, mouse: MouseEvent, body: Rect) {
+        let tree_width = self.tree_pane_width(body.width);
+        let tree_area = Rect::new(body.x, body.y, tree_width, body.height);
+        let right_x = body.x.saturating_add(tree_width);
+        let right_area = Rect::new(
+            right_x,
+            body.y,
+            body.right().saturating_sub(right_x),
+            body.height,
+        );
+
+        match drag {
+            ScrollbarDrag::Tree { grab_offset } => {
+                let maximum = self.tree_max_scroll(ui::tree_items_area(tree_area).height);
+                let Some(scrollbar) = ui::tree_scrollbar(self, tree_area) else {
+                    return;
+                };
+                self.tree_scroll = scrollbar.position_for_drag(mouse.row, grab_offset, maximum);
+                self.tree_scroll_locked = true;
+            }
+            ScrollbarDrag::Preview { grab_offset } => {
+                let maximum = ui::preview_max_scroll(self, right_area);
+                let Some(scrollbar) = ui::preview_scrollbar(self, right_area) else {
+                    return;
+                };
+                self.preview_scroll = scrollbar.position_for_drag(mouse.row, grab_offset, maximum);
+            }
+            ScrollbarDrag::FilterPreview { grab_offset } => {
+                let maximum = ui::filter_preview_max_scroll(self, body);
+                let Some(scrollbar) = ui::filter_preview_scrollbar(self, body) else {
+                    return;
+                };
+                self.filter_preview_scroll =
+                    scrollbar.position_for_drag(mouse.row, grab_offset, maximum);
+            }
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent, body: Rect) {
         if self.show_help {
+            return;
+        }
+
+        if let Some(drag) = self.scrollbar_drag
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            self.drag_scrollbar(drag, mouse, body);
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                self.scrollbar_drag = None;
+            }
             return;
         }
 
@@ -938,6 +1040,13 @@ impl App {
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.scroll_filter_preview(-3),
                 MouseEventKind::ScrollDown => self.scroll_filter_preview(3),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(grab_offset) = ui::filter_preview_scrollbar(self, body)
+                        .and_then(|scrollbar| scrollbar.grab_offset(position))
+                    {
+                        self.scrollbar_drag = Some(ScrollbarDrag::FilterPreview { grab_offset });
+                    }
+                }
                 _ => {}
             }
             return;
@@ -964,11 +1073,21 @@ impl App {
             MouseEventKind::ScrollDown if over_body && mouse.column >= right_x => {
                 self.scroll_preview(3, right_area)
             }
-            MouseEventKind::ScrollUp if over_body => self.move_by(-3),
-            MouseEventKind::ScrollDown if over_body => self.move_by(3),
+            MouseEventKind::ScrollUp if over_body => self.scroll_tree(-3, tree_area),
+            MouseEventKind::ScrollDown if over_body => self.scroll_tree(3, tree_area),
             MouseEventKind::Down(MouseButton::Left) if over_body => {
                 let divider = body.x.saturating_add(tree_width).saturating_sub(1);
-                if mouse.column.abs_diff(divider) <= 1 {
+                if let Some(grab_offset) = ui::tree_scrollbar(self, tree_area)
+                    .and_then(|scrollbar| scrollbar.grab_offset(position))
+                {
+                    self.last_tree_click = None;
+                    self.scrollbar_drag = Some(ScrollbarDrag::Tree { grab_offset });
+                } else if let Some(grab_offset) = ui::preview_scrollbar(self, right_area)
+                    .and_then(|scrollbar| scrollbar.grab_offset(position))
+                {
+                    self.last_tree_click = None;
+                    self.scrollbar_drag = Some(ScrollbarDrag::Preview { grab_offset });
+                } else if mouse.column.abs_diff(divider) <= 1 {
                     self.last_tree_click = None;
                     self.dragging_divider = true;
                     self.resize_to_column(mouse.column, body);
@@ -1281,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_targets_the_pane_under_the_pointer() {
+    fn mouse_wheel_scrolls_the_hovered_pane_without_changing_selection() {
         let value = Value::Array((0..20).map(Value::from).collect());
         let mut app = App::new(value, "test".into(), 1);
         let body = Rect::new(0, 3, 100, 5);
@@ -1291,8 +1410,93 @@ mod tests {
         assert_eq!(app.preview_scroll, 3);
 
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 10, 4), body);
-        assert_eq!(app.selected_visible_index(), 3);
-        assert_eq!(app.preview_scroll, 0);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.tree_view_offset(body.height), 3);
+        assert_eq!(app.preview_scroll, 3);
+    }
+
+    #[test]
+    fn keyboard_navigation_brings_the_selection_back_into_view() {
+        let value = Value::Array((0..20).map(Value::from).collect());
+        let mut app = App::new(value, "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 5);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 10, 4), body);
+        assert_eq!(app.tree_view_offset(body.height), 3);
+
+        app.handle_key(key(KeyCode::Down));
+
+        assert_eq!(app.selected_visible_index(), 1);
+        assert_eq!(app.tree_view_offset(body.height), 0);
+    }
+
+    #[test]
+    fn dragging_the_tree_scrollbar_handle_moves_only_the_viewport() {
+        let value = Value::Array((0..100).map(Value::from).collect());
+        let mut app = App::new(value, "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 10);
+
+        // The tree thumb starts at the top of the divider column.
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 57, body.y + 1),
+            body,
+        );
+        assert!(matches!(
+            app.scrollbar_drag,
+            Some(ScrollbarDrag::Tree { .. })
+        ));
+
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                57,
+                body.bottom() - 2,
+            ),
+            body,
+        );
+        assert_eq!(app.selected, 0);
+        assert_eq!(
+            app.tree_view_offset(body.height),
+            app.tree_max_scroll(body.height)
+        );
+
+        app.handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 57, body.bottom()),
+            body,
+        );
+        assert_eq!(app.scrollbar_drag, None);
+    }
+
+    #[test]
+    fn dragging_the_value_scrollbar_handle_scrolls_the_preview() {
+        let value = Value::Array((0..100).map(Value::from).collect());
+        let mut app = App::new(value, "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 10);
+        let right_x = app.tree_pane_width(body.width);
+        let right_area = Rect::new(right_x, body.y, body.width - right_x, body.height);
+
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                body.right() - 1,
+                body.y,
+            ),
+            body,
+        );
+        assert!(matches!(
+            app.scrollbar_drag,
+            Some(ScrollbarDrag::Preview { .. })
+        ));
+
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                body.right() - 1,
+                body.bottom() - 2,
+            ),
+            body,
+        );
+        assert_eq!(app.preview_scroll, ui::preview_max_scroll(&app, right_area));
     }
 
     #[test]
@@ -1432,6 +1636,29 @@ mod tests {
             body,
         );
         assert_eq!(app.filter_preview_scroll(), 8);
+    }
+
+    #[test]
+    fn dragging_the_filter_scrollbar_handle_scrolls_the_live_preview() {
+        let value = Value::Array((0..100).map(Value::from).collect());
+        let mut app = App::new(value, "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 20);
+        app.handle_key(key(KeyCode::Char('|')));
+        type_text(&mut app, ".");
+        finish_filter_preview(&mut app);
+
+        // For this body, the live-preview scrollbar spans y=15..22 at x=87.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 87, 15), body);
+        assert!(matches!(
+            app.scrollbar_drag,
+            Some(ScrollbarDrag::FilterPreview { .. })
+        ));
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 87, 21), body);
+        assert_eq!(
+            app.filter_preview_scroll(),
+            ui::filter_preview_max_scroll(&app, body)
+        );
     }
 
     #[test]

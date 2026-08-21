@@ -5,7 +5,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
@@ -21,6 +21,121 @@ const MUTED: Color = Color::DarkGray;
 const BREADCRUMB_SEPARATOR: &str = " › ";
 const HIDDEN_BREADCRUMBS: &str = "… › ";
 const FILTER_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VerticalScrollbar {
+    x: u16,
+    y: u16,
+    track_length: u16,
+    thumb_start: u16,
+    thumb_length: u16,
+    content_length: usize,
+    viewport_length: usize,
+}
+
+impl VerticalScrollbar {
+    pub(crate) fn grab_offset(self, position: Position) -> Option<u16> {
+        let thumb_y = self.y.saturating_add(self.thumb_start);
+        if position.x == self.x
+            && position.y >= thumb_y
+            && position.y < thumb_y.saturating_add(self.thumb_length)
+        {
+            Some(position.y.saturating_sub(thumb_y))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn position_for_drag(
+        self,
+        pointer_y: u16,
+        grab_offset: u16,
+        maximum: usize,
+    ) -> usize {
+        if maximum == 0 {
+            return 0;
+        }
+
+        let maximum_thumb_start = scrollbar_thumb_start(
+            self.track_length,
+            self.content_length,
+            maximum,
+            self.viewport_length,
+        );
+        if maximum_thumb_start == 0 {
+            return 0;
+        }
+
+        let desired = i64::from(pointer_y) - i64::from(self.y) - i64::from(grab_offset);
+        let desired = desired.clamp(0, i64::from(maximum_thumb_start)) as usize;
+        let numerator = desired as u128 * maximum as u128 + u128::from(maximum_thumb_start) / 2;
+        (numerator / u128::from(maximum_thumb_start)) as usize
+    }
+}
+
+fn vertical_scrollbar(
+    area: Rect,
+    content_length: usize,
+    position: usize,
+    viewport_length: usize,
+) -> Option<VerticalScrollbar> {
+    if area.width == 0 || area.height == 0 || content_length == 0 {
+        return None;
+    }
+    let viewport_length = if viewport_length == 0 {
+        usize::from(area.height)
+    } else {
+        viewport_length
+    };
+    let thumb_start = scrollbar_thumb_start(area.height, content_length, position, viewport_length);
+    let thumb_end = scrollbar_thumb_end(area.height, content_length, position, viewport_length);
+
+    Some(VerticalScrollbar {
+        x: area.right().saturating_sub(1),
+        y: area.y,
+        track_length: area.height,
+        thumb_start,
+        thumb_length: thumb_end.saturating_sub(thumb_start).max(1),
+        content_length,
+        viewport_length,
+    })
+}
+
+fn scrollbar_thumb_start(
+    track_length: u16,
+    content_length: usize,
+    position: usize,
+    viewport_length: usize,
+) -> u16 {
+    // These calculations mirror Ratatui's private Scrollbar::part_lengths so
+    // pointer hit-testing stays on the cells used to render the thumb.
+    let maximum_position = content_length.saturating_sub(1) as f64;
+    let position = (position as f64).clamp(0.0, maximum_position);
+    let denominator = maximum_position + viewport_length as f64;
+    if denominator == 0.0 {
+        return 0;
+    }
+    (position * f64::from(track_length) / denominator)
+        .round()
+        .clamp(0.0, f64::from(track_length.saturating_sub(1))) as u16
+}
+
+fn scrollbar_thumb_end(
+    track_length: u16,
+    content_length: usize,
+    position: usize,
+    viewport_length: usize,
+) -> u16 {
+    let maximum_position = content_length.saturating_sub(1) as f64;
+    let position = (position as f64).clamp(0.0, maximum_position);
+    let denominator = maximum_position + viewport_length as f64;
+    if denominator == 0.0 {
+        return 0;
+    }
+    ((position + viewport_length as f64) * f64::from(track_length) / denominator)
+        .round()
+        .clamp(0.0, f64::from(track_length)) as u16
+}
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = page_areas(frame.area());
@@ -102,7 +217,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
     let selected = app.selected_visible_index();
     let viewport_height = usize::from(tree_items_area(area).height);
-    let offset = selected.saturating_sub(viewport_height.saturating_sub(1));
+    let offset = app.tree_view_offset(viewport_height.min(usize::from(u16::MAX)) as u16);
     let end = offset
         .saturating_add(viewport_height)
         .min(app.visible.len());
@@ -110,26 +225,34 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|&id| tree_item(app, id))
         .collect::<Vec<_>>();
-    let mut state = ListState::default().with_selected(Some(selected.saturating_sub(offset)));
+    let visible_selection = selected
+        .checked_sub(offset)
+        .filter(|&index| index < viewport_height);
+    let mut state = ListState::default().with_selected(visible_selection);
     let list = List::new(items)
         .block(tree_block(app))
         .highlight_style(Style::default().bg(Color::Rgb(34, 50, 60)).fg(Color::White))
-        .highlight_symbol("▌");
+        .highlight_symbol("▌")
+        .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(list, area, &mut state);
 
-    let mut scrollbar_state = ScrollbarState::new(app.visible.len()).position(selected);
-    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(None)
-        .end_symbol(None)
-        .track_symbol(None);
-    frame.render_stateful_widget(
-        scrollbar,
-        area.inner(Margin {
-            vertical: 1,
-            horizontal: 0,
-        }),
-        &mut scrollbar_state,
-    );
+    if app.visible.len() > viewport_height {
+        let mut scrollbar_state = ScrollbarState::new(app.visible.len())
+            .position(offset)
+            .viewport_content_length(viewport_height);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None);
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn tree_block(app: &App) -> Block<'static> {
@@ -150,6 +273,21 @@ pub(crate) fn tree_items_area(area: Rect) -> Rect {
         .borders(Borders::RIGHT)
         .title(" ")
         .inner(area)
+}
+
+pub(crate) fn tree_scrollbar(app: &App, area: Rect) -> Option<VerticalScrollbar> {
+    let viewport_height = tree_items_area(area).height;
+    (app.visible.len() > usize::from(viewport_height)).then_some(())?;
+    let scrollbar_area = area.inner(Margin {
+        vertical: 1,
+        horizontal: 0,
+    });
+    vertical_scrollbar(
+        scrollbar_area,
+        app.visible.len(),
+        app.tree_view_offset(viewport_height),
+        usize::from(viewport_height),
+    )
 }
 
 fn tree_item(app: &App, id: NodeId) -> ListItem<'static> {
@@ -358,6 +496,18 @@ pub(crate) fn preview_max_scroll(app: &App, area: Rect) -> usize {
     app.tree
         .pretty_line_count(app.selected)
         .saturating_sub(usize::from(area.height))
+}
+
+pub(crate) fn preview_scrollbar(app: &App, area: Rect) -> Option<VerticalScrollbar> {
+    let (_, preview_area) = preview_areas(area);
+    let content_length = app.tree.pretty_line_count(app.selected);
+    (content_length > usize::from(preview_area.height)).then_some(())?;
+    vertical_scrollbar(
+        area,
+        content_length,
+        app.preview_scroll.min(preview_max_scroll(app, area)),
+        usize::from(preview_area.height),
+    )
 }
 
 fn preview_text(app: &App, start: usize, height: usize) -> Text<'static> {
@@ -669,6 +819,36 @@ pub(crate) fn filter_overlay_area(body: Rect) -> Rect {
     )
 }
 
+fn filter_preview_area(body: Rect) -> Rect {
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .inner(filter_overlay_area(body));
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner)[1]
+}
+
+pub(crate) fn filter_preview_max_scroll(app: &App, body: Rect) -> usize {
+    let area = filter_preview_area(body);
+    app.filter_preview_lines().map_or(0, |lines| {
+        lines.len().saturating_sub(usize::from(area.height))
+    })
+}
+
+pub(crate) fn filter_preview_scrollbar(app: &App, body: Rect) -> Option<VerticalScrollbar> {
+    let area = filter_preview_area(body);
+    let content_length = app.filter_preview_lines()?.len();
+    (content_length > usize::from(area.height)).then_some(())?;
+    vertical_scrollbar(
+        area,
+        content_length,
+        app.filter_preview_scroll()
+            .min(filter_preview_max_scroll(app, body)),
+        usize::from(area.height),
+    )
+}
+
 fn prompt_view(text: &str, cursor: usize, available: usize) -> (String, u16) {
     if available == 0 {
         return (String::new(), 0);
@@ -738,8 +918,8 @@ fn draw_help(frame: &mut Frame) {
         Line::from("  -/+             resize the tree and value panes"),
         Line::from("  Mouse click     select a tree row or navigate a breadcrumb"),
         Line::from("  Double-click    expand or collapse a container row"),
-        Line::from("  Mouse wheel     move the tree or scroll the hovered value"),
-        Line::from("  Mouse drag      resize using the pane divider"),
+        Line::from("  Mouse wheel     scroll the tree or hovered value"),
+        Line::from("  Mouse drag      scroll a handle or resize the pane divider"),
         Line::from("  Esc             clear the active search"),
         Line::from("  p / P           print selected value / path and quit"),
         Line::from("  q, Ctrl-c       quit"),
