@@ -40,6 +40,8 @@ const MIN_PANE_WIDTH: u16 = 20;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const FILTER_PREVIEW_DEBOUNCE: Duration = Duration::from_millis(75);
 const FILTER_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const FILTER_SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+const FILTER_SPINNER_FRAMES: usize = 10;
 
 struct FilterRequest {
     generation: u64,
@@ -88,17 +90,29 @@ impl FilterWorker {
     }
 }
 
-struct FilterEditSnapshot {
-    value: Arc<Value>,
-    expression: Option<String>,
-    output_count: Option<usize>,
+struct FilterPreview {
+    expression: String,
+    output: filter::FilterOutput,
+    lines: Vec<String>,
+}
+
+impl FilterPreview {
+    fn new(expression: String, output: filter::FilterOutput) -> Self {
+        let formatted = serde_json::to_string_pretty(&output.value)
+            .unwrap_or_else(|_| output.value.to_string());
+        let lines = formatted.lines().map(str::to_owned).collect();
+        Self {
+            expression,
+            output,
+            lines,
+        }
+    }
 }
 
 pub struct App {
     pub tree: JsonTree,
     pub source: String,
     source_value: Arc<Value>,
-    current_value: Arc<Value>,
     pub selected: NodeId,
     pub visible: Vec<NodeId>,
     pub input_mode: InputMode,
@@ -119,7 +133,10 @@ pub struct App {
     filter_generation: u64,
     filter_preview_deadline: Option<Instant>,
     latest_dispatched_filter: Option<u64>,
-    filter_edit_snapshot: Option<FilterEditSnapshot>,
+    filter_preview: Option<FilterPreview>,
+    filter_preview_scroll: usize,
+    filter_spinner_frame: usize,
+    filter_spinner_deadline: Option<Instant>,
     pane_split_percent: u16,
     dragging_divider: bool,
     last_tree_click: Option<(NodeId, Instant)>,
@@ -140,7 +157,6 @@ impl App {
         Self {
             tree,
             source,
-            current_value: Arc::clone(&source_value),
             source_value,
             selected: 0,
             visible,
@@ -162,7 +178,10 @@ impl App {
             filter_generation: 0,
             filter_preview_deadline: None,
             latest_dispatched_filter: None,
-            filter_edit_snapshot: None,
+            filter_preview: None,
+            filter_preview_scroll: 0,
+            filter_spinner_frame: 0,
+            filter_spinner_deadline: None,
             pane_split_percent: DEFAULT_TREE_PANE_PERCENT,
             dragging_divider: false,
             last_tree_click: None,
@@ -328,6 +347,14 @@ impl App {
             KeyCode::Right => {
                 self.input_cursor = (self.input_cursor + 1).min(self.input.chars().count())
             }
+            KeyCode::Up if self.input_mode == InputMode::Filter => self.scroll_filter_preview(-1),
+            KeyCode::Down if self.input_mode == InputMode::Filter => self.scroll_filter_preview(1),
+            KeyCode::PageUp if self.input_mode == InputMode::Filter => {
+                self.scroll_filter_preview(-5)
+            }
+            KeyCode::PageDown if self.input_mode == InputMode::Filter => {
+                self.scroll_filter_preview(5)
+            }
             KeyCode::Home => self.input_cursor = 0,
             KeyCode::End => self.input_cursor = self.input.chars().count(),
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -359,13 +386,8 @@ impl App {
     }
 
     fn begin_input(&mut self, mode: InputMode) {
-        if mode == InputMode::Filter {
-            self.filter_edit_snapshot = Some(FilterEditSnapshot {
-                value: Arc::clone(&self.current_value),
-                expression: self.active_filter.clone(),
-                output_count: self.filter_output_count,
-            });
-        }
+        self.filter_preview = None;
+        self.filter_preview_scroll = 0;
         self.input_mode = mode;
         self.input = match mode {
             InputMode::Search => self.search_query.clone().unwrap_or_default(),
@@ -374,6 +396,9 @@ impl App {
         };
         self.input_cursor = self.input.chars().count();
         self.message = None;
+        if mode == InputMode::Filter && !self.input.trim().is_empty() {
+            self.schedule_filter_preview();
+        }
     }
 
     fn remove_before_cursor(&mut self) {
@@ -517,23 +542,38 @@ impl App {
         let expression = self.input.trim().to_owned();
         if expression.is_empty() {
             self.clear_filter();
-            self.filter_edit_snapshot = None;
+            self.filter_preview = None;
+            self.filter_preview_scroll = 0;
             return true;
         }
 
         if self.active_filter.as_deref() == Some(expression.as_str()) {
             let count = self.filter_output_count.unwrap_or(0);
             self.message = Some(filter_status("Filter applied", count));
-            self.filter_edit_snapshot = None;
+            self.filter_preview = None;
+            self.filter_preview_scroll = 0;
             return true;
         }
 
-        match filter::evaluate(&self.source_value, &expression) {
+        let preview_matches = self
+            .filter_preview
+            .as_ref()
+            .is_some_and(|preview| preview.expression == expression);
+        let result = if preview_matches {
+            Ok(self
+                .filter_preview
+                .take()
+                .expect("matching filter preview is present")
+                .output)
+        } else {
+            filter::evaluate(&self.source_value, &expression)
+        };
+        match result {
             Ok(output) => {
                 let count = output.count;
                 self.apply_filter_output(expression, output);
                 self.message = Some(filter_status("Filter applied", count));
-                self.filter_edit_snapshot = None;
+                self.filter_preview_scroll = 0;
                 true
             }
             Err(error) => {
@@ -559,25 +599,36 @@ impl App {
 
     fn schedule_filter_preview(&mut self) {
         self.filter_generation = self.filter_generation.wrapping_add(1);
-        self.filter_preview_deadline = Some(Instant::now() + FILTER_PREVIEW_DEBOUNCE);
+        let now = Instant::now();
+        self.filter_preview_deadline = Some(now + FILTER_PREVIEW_DEBOUNCE);
+        self.filter_preview_scroll = 0;
+        self.filter_spinner_frame = 0;
+        self.filter_spinner_deadline = Some(now + FILTER_SPINNER_INTERVAL);
     }
 
     fn cancel_pending_filter_preview(&mut self) {
         self.filter_generation = self.filter_generation.wrapping_add(1);
         self.filter_preview_deadline = None;
+        self.filter_spinner_deadline = None;
     }
 
     fn cancel_filter_edit(&mut self) {
         self.cancel_pending_filter_preview();
-        if let Some(snapshot) = self.filter_edit_snapshot.take() {
-            self.replace_tree(snapshot.value);
-            self.active_filter = snapshot.expression;
-            self.filter_output_count = snapshot.output_count;
-        }
+        self.filter_preview = None;
+        self.filter_preview_scroll = 0;
     }
 
     fn process_filter_preview(&mut self, now: Instant) -> bool {
         let mut changed = false;
+        if self.is_filter_preview_pending()
+            && self
+                .filter_spinner_deadline
+                .is_some_and(|deadline| deadline <= now)
+        {
+            self.filter_spinner_frame = (self.filter_spinner_frame + 1) % FILTER_SPINNER_FRAMES;
+            self.filter_spinner_deadline = Some(now + FILTER_SPINNER_INTERVAL);
+            changed = true;
+        }
         if self
             .filter_preview_deadline
             .is_some_and(|deadline| deadline <= now)
@@ -585,9 +636,7 @@ impl App {
             self.filter_preview_deadline = None;
             let expression = self.input.trim().to_owned();
             if expression.is_empty() {
-                self.replace_tree(Arc::clone(&self.source_value));
-                self.active_filter = None;
-                self.filter_output_count = None;
+                self.filter_preview = None;
                 self.message = None;
                 changed = true;
             } else {
@@ -613,22 +662,37 @@ impl App {
             }
             match response.result {
                 Ok(output) => {
-                    self.apply_filter_output(response.expression, output);
+                    self.filter_preview = Some(FilterPreview::new(response.expression, output));
                     self.message = None;
                 }
                 Err(error) => self.message = Some(error.to_string()),
             }
             changed = true;
         }
+        if !self.is_filter_preview_pending() {
+            self.filter_spinner_deadline = None;
+        }
         changed
     }
 
     fn next_filter_update_in(&self, now: Instant) -> Option<Duration> {
-        if let Some(deadline) = self.filter_preview_deadline {
-            return Some(deadline.saturating_duration_since(now));
+        let mut wait = self
+            .filter_preview_deadline
+            .map(|deadline| deadline.saturating_duration_since(now));
+        if self.latest_dispatched_filter.is_some() {
+            wait = Some(
+                wait.map(|duration| duration.min(FILTER_WORKER_POLL_INTERVAL))
+                    .unwrap_or(FILTER_WORKER_POLL_INTERVAL),
+            );
         }
-        self.latest_dispatched_filter
-            .map(|_| FILTER_WORKER_POLL_INTERVAL)
+        if let Some(deadline) = self.filter_spinner_deadline {
+            let spinner_wait = deadline.saturating_duration_since(now);
+            wait = Some(
+                wait.map(|duration| duration.min(spinner_wait))
+                    .unwrap_or(spinner_wait),
+            );
+        }
+        wait
     }
 
     pub fn is_filter_preview_pending(&self) -> bool {
@@ -636,8 +700,39 @@ impl App {
             || self.latest_dispatched_filter == Some(self.filter_generation)
     }
 
+    pub fn filter_preview(&self) -> Option<(&Value, usize)> {
+        self.filter_preview
+            .as_ref()
+            .map(|preview| (&preview.output.value, preview.output.count))
+    }
+
+    pub fn filter_preview_lines(&self) -> Option<&[String]> {
+        self.filter_preview
+            .as_ref()
+            .map(|preview| preview.lines.as_slice())
+    }
+
+    pub fn filter_preview_scroll(&self) -> usize {
+        self.filter_preview_scroll
+    }
+
+    pub fn filter_spinner_frame(&self) -> usize {
+        self.filter_spinner_frame
+    }
+
+    fn scroll_filter_preview(&mut self, amount: isize) {
+        if self.filter_preview.is_none() {
+            return;
+        }
+        self.filter_preview_scroll = if amount < 0 {
+            self.filter_preview_scroll
+                .saturating_sub(amount.unsigned_abs())
+        } else {
+            self.filter_preview_scroll.saturating_add(amount as usize)
+        };
+    }
+
     fn replace_tree(&mut self, value: Arc<Value>) {
-        self.current_value = Arc::clone(&value);
         self.tree = JsonTree::from_shared(value, self.expand_depth);
         self.selected = 0;
         self.visible = self.tree.visible();
@@ -834,6 +929,20 @@ impl App {
             return;
         }
 
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        if self.input_mode == InputMode::Filter
+            && !self.dragging_divider
+            && ui::filter_overlay_area(body).contains(position)
+        {
+            self.last_tree_click = None;
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_filter_preview(-3),
+                MouseEventKind::ScrollDown => self.scroll_filter_preview(3),
+                _ => {}
+            }
+            return;
+        }
+
         let over_body = mouse.row >= body.y
             && mouse.row < body.bottom()
             && mouse.column >= body.x
@@ -867,7 +976,6 @@ impl App {
                     self.select_tree_row(mouse, tree_area);
                 } else {
                     self.last_tree_click = None;
-                    let position = ratatui::layout::Position::new(mouse.column, mouse.row);
                     if let Some(target) = ui::breadcrumb_target_at(self, right_area, position) {
                         self.jump_to(target);
                     }
@@ -1229,6 +1337,29 @@ mod tests {
     }
 
     #[test]
+    fn filter_overlay_absorbs_mouse_events_over_the_document() {
+        let mut app = App::new(
+            Value::Array((0..30).map(Value::from).collect()),
+            "test".into(),
+            1,
+        );
+        let body = Rect::new(0, 3, 100, 20);
+        let overlay = ui::filter_overlay_area(body);
+        app.handle_key(key(KeyCode::Char('|')));
+
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                overlay.x.saturating_add(1),
+                overlay.y,
+            ),
+            body,
+        );
+
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
     fn jq_filter_replaces_the_tree_with_navigable_stream_results() {
         let mut app = App::new(
             json!({"users": [{"name": "Ada", "active": true}, {"name": "Lin", "active": false}]}),
@@ -1254,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn jq_filter_updates_live_after_a_short_debounce() {
+    fn jq_filter_previews_live_without_replacing_the_document() {
         let original = json!({"users": [{"name": "Ada"}, {"name": "Lin"}]});
         let mut app = App::new(original.clone(), "test".into(), 1);
 
@@ -1263,13 +1394,44 @@ mod tests {
 
         assert_eq!(app.tree.value_at(0), &original);
         assert!(app.is_filter_preview_pending());
+        let spinner_before = app.filter_spinner_frame();
+        assert!(app.process_filter_preview(Instant::now() + FILTER_SPINNER_INTERVAL));
+        assert_ne!(app.filter_spinner_frame(), spinner_before);
 
         finish_filter_preview(&mut app);
 
         assert_eq!(app.input_mode, InputMode::Filter);
-        assert_eq!(app.tree.value_at(0), &json!(["Ada", "Lin"]));
-        assert_eq!(app.active_filter.as_deref(), Some(".users[].name"));
-        assert_eq!(app.filter_output_count, Some(2));
+        assert_eq!(app.tree.value_at(0), &original);
+        assert_eq!(app.active_filter, None);
+        assert_eq!(app.filter_output_count, None);
+        assert_eq!(app.filter_preview(), Some((&json!(["Ada", "Lin"]), 2)));
+        let cached_lines = app
+            .filter_preview_lines()
+            .expect("valid filter has cached preview lines");
+        let cached_lines_address = cached_lines.as_ptr();
+        assert_eq!(cached_lines, ["[", "  \"Ada\",", "  \"Lin\"", "]"]);
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.filter_preview_scroll(), 6);
+        assert_eq!(
+            app.filter_preview_lines().unwrap().as_ptr(),
+            cached_lines_address
+        );
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.filter_preview_scroll(), 5);
+
+        let body = Rect::new(0, 3, 100, 20);
+        let overlay = ui::filter_overlay_area(body);
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::ScrollDown,
+                overlay.x.saturating_add(1),
+                overlay.y.saturating_add(1),
+            ),
+            body,
+        );
+        assert_eq!(app.filter_preview_scroll(), 8);
     }
 
     #[test]
@@ -1278,14 +1440,22 @@ mod tests {
         app.handle_key(key(KeyCode::Char('|')));
         type_text(&mut app, ".left");
         finish_filter_preview(&mut app);
-        assert_eq!(app.tree.value_at(0), &json!([1, 2]));
+        assert_eq!(
+            app.tree.value_at(0),
+            &json!({"left": [1, 2], "right": [3, 4]})
+        );
+        assert_eq!(app.filter_preview(), Some((&json!([1, 2]), 1)));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         type_text(&mut app, ".[\"");
         finish_filter_preview(&mut app);
 
-        assert_eq!(app.tree.value_at(0), &json!([1, 2]));
-        assert_eq!(app.active_filter.as_deref(), Some(".left"));
+        assert_eq!(
+            app.tree.value_at(0),
+            &json!({"left": [1, 2], "right": [3, 4]})
+        );
+        assert_eq!(app.filter_preview(), Some((&json!([1, 2]), 1)));
+        assert_eq!(app.active_filter, None);
         assert!(
             app.message
                 .as_deref()
@@ -1304,7 +1474,8 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         type_text(&mut app, ".right");
         finish_filter_preview(&mut app);
-        assert_eq!(app.tree.value_at(0), &json!([3, 4]));
+        assert_eq!(app.tree.value_at(0), &json!([1, 2]));
+        assert_eq!(app.filter_preview(), Some((&json!([3, 4]), 1)));
 
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.input_mode, InputMode::Normal);

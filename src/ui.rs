@@ -20,6 +20,7 @@ const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
 const BREADCRUMB_SEPARATOR: &str = " › ";
 const HIDDEN_BREADCRUMBS: &str = "… › ";
+const FILTER_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = page_areas(frame.area());
@@ -27,6 +28,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_header(frame, app, chunks[0]);
     draw_body(frame, app, chunks[1]);
     draw_footer(frame, app, chunks[2]);
+
+    if app.input_mode == InputMode::Filter {
+        draw_filter_overlay(frame, app, chunks[1]);
+    }
 
     if app.show_help {
         draw_help(frame);
@@ -509,7 +514,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let (prefix, text, style) = match app.input_mode {
         InputMode::Search => ("/", app.input.clone(), Style::default().fg(Color::Yellow)),
         InputMode::Jump => (":", app.input.clone(), Style::default().fg(ACCENT)),
-        InputMode::Filter => ("|", app.input.clone(), Style::default().fg(Color::Magenta)),
+        InputMode::Filter => ("", String::new(), Style::default().fg(Color::Magenta)),
         InputMode::Normal => {
             let status = app
                 .message
@@ -542,30 +547,126 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         lines[0],
     );
     let hint = if app.input_mode == InputMode::Filter {
-        if let Some(message) = app.message.as_deref() {
-            message
-        } else if app.is_filter_preview_pending() {
-            "Filtering…   Enter keep   Esc cancel"
-        } else {
-            "Live preview   Enter keep   Esc cancel   Ctrl-u clear   Ctrl-w erase word"
-        }
+        "↑↓/PgUp/PgDn scroll preview   Enter apply   Esc cancel"
     } else {
         "↑↓/jk move   ←→/hl structure   / search   : path   | jq   p print   ? help"
     };
-    let hint_style = if app.input_mode == InputMode::Filter && app.message.is_some() {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(MUTED)
-    };
+    let hint_style = Style::default().fg(MUTED);
     frame.render_widget(Paragraph::new(hint).style(hint_style), lines[1]);
 
-    if app.input_mode != InputMode::Normal {
+    if matches!(app.input_mode, InputMode::Search | InputMode::Jump) {
         let cursor_x = lines[0].x + 1 + cursor_column;
         frame.set_cursor_position(Position::new(
             cursor_x.min(lines[0].right() - 1),
             lines[0].y,
         ));
     }
+}
+
+fn draw_filter_overlay(frame: &mut Frame, app: &App, body: Rect) {
+    let area = filter_overlay_area(body);
+    frame.render_widget(Clear, area);
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title_top(Line::from(Span::styled(
+            " jq filter ",
+            Style::default().fg(Color::Magenta).bold(),
+        )));
+    if app.is_filter_preview_pending() {
+        let spinner = FILTER_SPINNER[app.filter_spinner_frame() % FILTER_SPINNER.len()];
+        block = block.title_top(
+            Line::from(Span::styled(
+                format!(" {spinner} "),
+                Style::default().fg(Color::Yellow),
+            ))
+            .right_aligned(),
+        );
+    } else if let Some((_, count)) = app.filter_preview() {
+        block = block.title_top(
+            Line::from(Span::styled(
+                format!(
+                    " {count} {} ",
+                    if count == 1 { "output" } else { "outputs" }
+                ),
+                Style::default().fg(MUTED),
+            ))
+            .right_aligned(),
+        );
+    }
+    if let Some(message) = app.message.as_deref() {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" {message} "),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+    let available = usize::from(rows[0].width.saturating_sub(2));
+    let (input, cursor_column) = prompt_view(&app.input, app.input_cursor, available);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("| ", Style::default().fg(Color::Magenta).bold()),
+            Span::styled(input, Style::default().fg(Color::White)),
+        ])),
+        rows[0],
+    );
+
+    if app.filter_preview().is_some() {
+        let maximum_lines = usize::from(rows[1].height);
+        let all_lines = app.filter_preview_lines().unwrap_or_default();
+        let total_lines = all_lines.len();
+        let maximum_scroll = total_lines.saturating_sub(maximum_lines);
+        let scroll = app.filter_preview_scroll().min(maximum_scroll);
+        let lines = all_lines
+            .iter()
+            .skip(scroll)
+            .take(maximum_lines)
+            .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(Color::Gray))))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), rows[1]);
+        if maximum_scroll > 0 {
+            let mut scrollbar_state = ScrollbarState::new(total_lines)
+                .position(scroll)
+                .viewport_content_length(maximum_lines);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(None);
+            frame.render_stateful_widget(scrollbar, rows[1], &mut scrollbar_state);
+        }
+    }
+
+    let cursor_x = rows[0]
+        .x
+        .saturating_add(2)
+        .saturating_add(cursor_column)
+        .min(rows[0].right().saturating_sub(1));
+    frame.set_cursor_position(Position::new(cursor_x, rows[0].y));
+}
+
+pub(crate) fn filter_overlay_area(body: Rect) -> Rect {
+    let available_width = body.width.saturating_sub(2);
+    let preferred_width = (u32::from(body.width) * 78 / 100) as u16;
+    let width = preferred_width
+        .max(40.min(available_width))
+        .min(available_width);
+    let height = (body.height / 2).clamp(7.min(body.height), 12.min(body.height));
+    Rect::new(
+        body.x.saturating_add(body.width.saturating_sub(width) / 2),
+        body.bottom().saturating_sub(height),
+        width,
+        height,
+    )
 }
 
 fn prompt_view(text: &str, cursor: usize, available: usize) -> (String, u16) {
@@ -599,7 +700,7 @@ fn prompt_view(text: &str, cursor: usize, available: usize) -> (String, u16) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let area = centered_rect(68, 34, frame.area());
+    let area = centered_rect(68, 35, frame.area());
     frame.render_widget(Clear, area);
     let help = vec![
         Line::from(Span::styled("Navigate", Style::default().fg(ACCENT).bold())),
@@ -623,8 +724,9 @@ fn draw_help(frame: &mut Frame) {
             "Filter with jq",
             Style::default().fg(ACCENT).bold(),
         )),
-        Line::from("  |               edit with live jq-compatible filtering"),
-        Line::from("  Enter / Esc     keep / cancel the live result"),
+        Line::from("  |               open the jq editor with live preview"),
+        Line::from("  ↑↓ / PgUp/PgDn scroll the live result preview"),
+        Line::from("  Enter / Esc     apply / dismiss the overlay result"),
         Line::from("  Esc             clear an applied filter (after search)"),
         Line::from(""),
         Line::from(Span::styled(
@@ -686,6 +788,8 @@ fn kind_style(kind: NodeKind) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
 
     fn line_text(line: &Line<'_>) -> String {
@@ -809,5 +913,43 @@ mod tests {
 
         assert_eq!(shown, "ct(.active)");
         assert_eq!(usize::from(cursor), text_width(&shown));
+    }
+
+    #[test]
+    fn filter_editor_is_an_overlay_that_leaves_the_document_visible() {
+        let mut app = App::new(
+            json!({"source_key": {"nested": true}, "another": 42}),
+            "test".into(),
+            1,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('|'), KeyModifiers::NONE));
+        for ch in ".source_key".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.message = Some("syntax error: expected a key".into());
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("source_key"));
+        assert!(rendered.contains("jq filter"));
+        assert!(!rendered.contains("live preview"));
+        assert!(rendered.contains(" ⠋ "));
+        assert!(!rendered.contains("Filtering"));
+        assert!(rendered.contains(".source_key"));
+
+        let overlay = filter_overlay_area(body_area(Rect::new(0, 0, 100, 28)));
+        let bottom_border = (overlay.x..overlay.right())
+            .map(|x| terminal.backend().buffer()[(x, overlay.bottom() - 1)].symbol())
+            .collect::<String>();
+        assert!(bottom_border.contains("syntax error: expected a key"));
     }
 }
