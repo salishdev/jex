@@ -880,15 +880,15 @@ fn prompt_view(text: &str, cursor: usize, available: usize) -> (String, u16) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let area = centered_rect(68, 35, frame.area());
+    let area = centered_rect(72, 41, frame.area());
     frame.render_widget(Clear, area);
     let help = vec![
         Line::from(Span::styled("Navigate", Style::default().fg(ACCENT).bold())),
         Line::from("  j/k, ↑/↓       previous / next visible node"),
         Line::from("  h/l, ←/→       collapse or parent / expand or child"),
         Line::from("  [/ ]           previous / next sibling"),
-        Line::from("  g/G             first / last visible node"),
-        Line::from("  Ctrl-u/Ctrl-d   move by a page"),
+        Line::from("  g/G, Home/End   first / last visible node"),
+        Line::from("  Ctrl-u/Ctrl-d, PgUp/PgDn   move by a page"),
         Line::from(""),
         Line::from(Span::styled(
             "Find your place",
@@ -899,6 +899,7 @@ fn draw_help(frame: &mut Frame) {
         Line::from("  :               jump to JSON Pointer (/users/0/name)"),
         Line::from("  b/f             back / forward through jumps"),
         Line::from("  m / '           set / return to a bookmark"),
+        Line::from("  Esc             clear search, then an applied filter"),
         Line::from(""),
         Line::from(Span::styled(
             "Filter with jq",
@@ -906,21 +907,29 @@ fn draw_help(frame: &mut Frame) {
         )),
         Line::from("  |               open the jq editor with live preview"),
         Line::from("  ↑↓ / PgUp/PgDn scroll the live result preview"),
+        Line::from("  Mouse wheel/drag scroll the hovered preview / handle"),
         Line::from("  Enter / Esc     apply / dismiss the overlay result"),
-        Line::from("  Esc             clear an applied filter (after search)"),
         Line::from(""),
         Line::from(Span::styled(
-            "Shape the tree",
+            "Edit prompts",
+            Style::default().fg(ACCENT).bold(),
+        )),
+        Line::from("  ←/→             move the cursor"),
+        Line::from("  Home/End, Ctrl-a/Ctrl-e   move to start / end"),
+        Line::from("  Backspace/Delete          erase before / at cursor"),
+        Line::from("  Ctrl-u/Ctrl-w   clear the line / erase previous word"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tree, mouse, and output",
             Style::default().fg(ACCENT).bold(),
         )),
         Line::from("  Space/Enter     expand or collapse"),
         Line::from("  e/c             expand / collapse the entire branch"),
-        Line::from("  -/+             resize the tree and value panes"),
-        Line::from("  Mouse click     select a tree row or navigate a breadcrumb"),
+        Line::from("  -/+, =          resize panes (saved between sessions)"),
+        Line::from("  Mouse click     select row, disclosure, or breadcrumb"),
         Line::from("  Double-click    expand or collapse a container row"),
         Line::from("  Mouse wheel     scroll the tree or hovered value"),
         Line::from("  Mouse drag      scroll a handle or resize the pane divider"),
-        Line::from("  Esc             clear the active search"),
         Line::from("  p / P           print selected value / path and quit"),
         Line::from("  q, Ctrl-c       quit"),
         Line::from(""),
@@ -1131,5 +1140,27 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, overlay.bottom() - 1)].symbol())
             .collect::<String>();
         assert!(bottom_border.contains("syntax error: expected a key"));
+    }
+
+    #[test]
+    fn help_includes_the_current_navigation_editing_and_persistence_controls() {
+        let mut app = App::new(json!({"value": true}), "test".into(), 1);
+        app.show_help = true;
+        let backend = TestBackend::new(100, 44);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("PgUp/PgDn"));
+        assert!(rendered.contains("Ctrl-a/Ctrl-e"));
+        assert!(rendered.contains("saved between sessions"));
+        assert!(rendered.contains("Press any key to close"));
     }
 }
