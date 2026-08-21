@@ -1,7 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
-    sync::Arc,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -34,11 +38,67 @@ pub enum InputMode {
 const DEFAULT_TREE_PANE_PERCENT: u16 = 58;
 const MIN_PANE_WIDTH: u16 = 20;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const FILTER_PREVIEW_DEBOUNCE: Duration = Duration::from_millis(75);
+const FILTER_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+struct FilterRequest {
+    generation: u64,
+    expression: String,
+}
+
+struct FilterResponse {
+    generation: u64,
+    expression: String,
+    result: Result<filter::FilterOutput, filter::FilterError>,
+}
+
+struct FilterWorker {
+    requests: Sender<FilterRequest>,
+    responses: Receiver<FilterResponse>,
+}
+
+impl FilterWorker {
+    fn new(source: Arc<Value>) -> Self {
+        let (request_sender, request_receiver) = mpsc::channel::<FilterRequest>();
+        let (response_sender, response_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let input = filter::prepare(&source);
+            while let Ok(mut request) = request_receiver.recv() {
+                // If typing outran evaluation, skip directly to the newest expression.
+                while let Ok(newer) = request_receiver.try_recv() {
+                    request = newer;
+                }
+                let response = FilterResponse {
+                    generation: request.generation,
+                    expression: request.expression.clone(),
+                    result: input
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|input| filter::evaluate_prepared(input, &request.expression)),
+                };
+                if response_sender.send(response).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests: request_sender,
+            responses: response_receiver,
+        }
+    }
+}
+
+struct FilterEditSnapshot {
+    value: Arc<Value>,
+    expression: Option<String>,
+    output_count: Option<usize>,
+}
 
 pub struct App {
     pub tree: JsonTree,
     pub source: String,
     source_value: Arc<Value>,
+    current_value: Arc<Value>,
     pub selected: NodeId,
     pub visible: Vec<NodeId>,
     pub input_mode: InputMode,
@@ -55,6 +115,11 @@ pub struct App {
     pub show_help: bool,
     pub output: Option<String>,
     pub preview_scroll: usize,
+    filter_worker: FilterWorker,
+    filter_generation: u64,
+    filter_preview_deadline: Option<Instant>,
+    latest_dispatched_filter: Option<u64>,
+    filter_edit_snapshot: Option<FilterEditSnapshot>,
     pane_split_percent: u16,
     dragging_divider: bool,
     last_tree_click: Option<(NodeId, Instant)>,
@@ -69,11 +134,13 @@ impl App {
     pub fn new(value: Value, source: String, expand_depth: usize) -> Self {
         let source_value = Arc::new(value);
         let tree = JsonTree::from_shared(Arc::clone(&source_value), expand_depth);
+        let filter_worker = FilterWorker::new(Arc::clone(&source_value));
         let visible = tree.visible();
         let visible_positions = Self::index_visible_nodes(&visible);
         Self {
             tree,
             source,
+            current_value: Arc::clone(&source_value),
             source_value,
             selected: 0,
             visible,
@@ -91,6 +158,11 @@ impl App {
             show_help: false,
             output: None,
             preview_scroll: 0,
+            filter_worker,
+            filter_generation: 0,
+            filter_preview_deadline: None,
+            latest_dispatched_filter: None,
+            filter_edit_snapshot: None,
             pane_split_percent: DEFAULT_TREE_PANE_PERCENT,
             dragging_divider: false,
             last_tree_click: None,
@@ -213,8 +285,12 @@ impl App {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) {
+        let input_before = self.input.clone();
         match key.code {
             KeyCode::Esc => {
+                if self.input_mode == InputMode::Filter {
+                    self.cancel_filter_edit();
+                }
                 self.input_mode = InputMode::Normal;
                 self.input.clear();
                 self.input_cursor = 0;
@@ -277,9 +353,19 @@ impl App {
             }
             _ => {}
         }
+        if self.input_mode == InputMode::Filter && self.input != input_before {
+            self.schedule_filter_preview();
+        }
     }
 
     fn begin_input(&mut self, mode: InputMode) {
+        if mode == InputMode::Filter {
+            self.filter_edit_snapshot = Some(FilterEditSnapshot {
+                value: Arc::clone(&self.current_value),
+                expression: self.active_filter.clone(),
+                output_count: self.filter_output_count,
+            });
+        }
         self.input_mode = mode;
         self.input = match mode {
             InputMode::Search => self.search_query.clone().unwrap_or_default(),
@@ -287,6 +373,7 @@ impl App {
             InputMode::Jump | InputMode::Normal => String::new(),
         };
         self.input_cursor = self.input.chars().count();
+        self.message = None;
     }
 
     fn remove_before_cursor(&mut self) {
@@ -426,22 +513,27 @@ impl App {
     }
 
     fn submit_filter(&mut self) -> bool {
+        self.cancel_pending_filter_preview();
         let expression = self.input.trim().to_owned();
         if expression.is_empty() {
             self.clear_filter();
+            self.filter_edit_snapshot = None;
+            return true;
+        }
+
+        if self.active_filter.as_deref() == Some(expression.as_str()) {
+            let count = self.filter_output_count.unwrap_or(0);
+            self.message = Some(filter_status("Filter applied", count));
+            self.filter_edit_snapshot = None;
             return true;
         }
 
         match filter::evaluate(&self.source_value, &expression) {
             Ok(output) => {
                 let count = output.count;
-                self.replace_tree(Arc::new(output.value));
-                self.active_filter = Some(expression);
-                self.filter_output_count = Some(count);
-                self.message = Some(format!(
-                    "Filter applied · {count} {}",
-                    if count == 1 { "output" } else { "outputs" }
-                ));
+                self.apply_filter_output(expression, output);
+                self.message = Some(filter_status("Filter applied", count));
+                self.filter_edit_snapshot = None;
                 true
             }
             Err(error) => {
@@ -458,7 +550,94 @@ impl App {
         self.message = Some("Filter cleared".into());
     }
 
+    fn apply_filter_output(&mut self, expression: String, output: filter::FilterOutput) {
+        let count = output.count;
+        self.replace_tree(Arc::new(output.value));
+        self.active_filter = Some(expression);
+        self.filter_output_count = Some(count);
+    }
+
+    fn schedule_filter_preview(&mut self) {
+        self.filter_generation = self.filter_generation.wrapping_add(1);
+        self.filter_preview_deadline = Some(Instant::now() + FILTER_PREVIEW_DEBOUNCE);
+    }
+
+    fn cancel_pending_filter_preview(&mut self) {
+        self.filter_generation = self.filter_generation.wrapping_add(1);
+        self.filter_preview_deadline = None;
+    }
+
+    fn cancel_filter_edit(&mut self) {
+        self.cancel_pending_filter_preview();
+        if let Some(snapshot) = self.filter_edit_snapshot.take() {
+            self.replace_tree(snapshot.value);
+            self.active_filter = snapshot.expression;
+            self.filter_output_count = snapshot.output_count;
+        }
+    }
+
+    fn process_filter_preview(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if self
+            .filter_preview_deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.filter_preview_deadline = None;
+            let expression = self.input.trim().to_owned();
+            if expression.is_empty() {
+                self.replace_tree(Arc::clone(&self.source_value));
+                self.active_filter = None;
+                self.filter_output_count = None;
+                self.message = None;
+                changed = true;
+            } else {
+                let request = FilterRequest {
+                    generation: self.filter_generation,
+                    expression,
+                };
+                if self.filter_worker.requests.send(request).is_ok() {
+                    self.latest_dispatched_filter = Some(self.filter_generation);
+                }
+            }
+        }
+
+        while let Ok(response) = self.filter_worker.responses.try_recv() {
+            if self.latest_dispatched_filter == Some(response.generation) {
+                self.latest_dispatched_filter = None;
+            }
+            if self.input_mode != InputMode::Filter
+                || response.generation != self.filter_generation
+                || response.expression != self.input.trim()
+            {
+                continue;
+            }
+            match response.result {
+                Ok(output) => {
+                    self.apply_filter_output(response.expression, output);
+                    self.message = None;
+                }
+                Err(error) => self.message = Some(error.to_string()),
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn next_filter_update_in(&self, now: Instant) -> Option<Duration> {
+        if let Some(deadline) = self.filter_preview_deadline {
+            return Some(deadline.saturating_duration_since(now));
+        }
+        self.latest_dispatched_filter
+            .map(|_| FILTER_WORKER_POLL_INTERVAL)
+    }
+
+    pub fn is_filter_preview_pending(&self) -> bool {
+        self.filter_preview_deadline.is_some()
+            || self.latest_dispatched_filter == Some(self.filter_generation)
+    }
+
     fn replace_tree(&mut self, value: Arc<Value>) {
+        self.current_value = Arc::clone(&value);
         self.tree = JsonTree::from_shared(value, self.expand_depth);
         self.selected = 0;
         self.visible = self.tree.visible();
@@ -717,6 +896,13 @@ fn char_to_byte(text: &str, character: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+fn filter_status(prefix: &str, count: usize) -> String {
+    format!(
+        "{prefix} · {count} {}",
+        if count == 1 { "output" } else { "outputs" }
+    )
+}
+
 pub fn run(app: &mut App) -> Result<()> {
     enable_raw_mode()?;
     let guard = TerminalGuard;
@@ -727,6 +913,16 @@ pub fn run(app: &mut App) -> Result<()> {
 
     terminal.draw(|frame| ui::draw(frame, app))?;
     while !app.should_quit {
+        let now = Instant::now();
+        if app.process_filter_preview(now) {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+        }
+        let wait = app
+            .next_filter_update_in(now)
+            .unwrap_or(Duration::from_secs(60));
+        if !event::poll(wait)? {
+            continue;
+        }
         let should_redraw = match event::read()? {
             Event::Key(key) => {
                 app.handle_key(key);
@@ -798,6 +994,22 @@ mod tests {
         app.input = input.into();
         app.input_cursor = input.chars().count();
         app.input_mode = mode;
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    fn finish_filter_preview(app: &mut App) {
+        app.process_filter_preview(Instant::now() + FILTER_PREVIEW_DEBOUNCE);
+        let timeout = Instant::now() + Duration::from_secs(1);
+        while app.is_filter_preview_pending() && Instant::now() < timeout {
+            thread::yield_now();
+            app.process_filter_preview(Instant::now());
+        }
+        assert!(!app.is_filter_preview_pending(), "filter preview timed out");
     }
 
     #[test]
@@ -1039,6 +1251,77 @@ mod tests {
         assert_eq!(app.filter_output_count, Some(1));
         assert_eq!(app.tree.value_at(0), &json!("Ada"));
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn jq_filter_updates_live_after_a_short_debounce() {
+        let original = json!({"users": [{"name": "Ada"}, {"name": "Lin"}]});
+        let mut app = App::new(original.clone(), "test".into(), 1);
+
+        app.handle_key(key(KeyCode::Char('|')));
+        type_text(&mut app, ".users[].name");
+
+        assert_eq!(app.tree.value_at(0), &original);
+        assert!(app.is_filter_preview_pending());
+
+        finish_filter_preview(&mut app);
+
+        assert_eq!(app.input_mode, InputMode::Filter);
+        assert_eq!(app.tree.value_at(0), &json!(["Ada", "Lin"]));
+        assert_eq!(app.active_filter.as_deref(), Some(".users[].name"));
+        assert_eq!(app.filter_output_count, Some(2));
+    }
+
+    #[test]
+    fn jq_live_errors_keep_the_last_valid_preview() {
+        let mut app = App::new(json!({"left": [1, 2], "right": [3, 4]}), "test".into(), 1);
+        app.handle_key(key(KeyCode::Char('|')));
+        type_text(&mut app, ".left");
+        finish_filter_preview(&mut app);
+        assert_eq!(app.tree.value_at(0), &json!([1, 2]));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut app, ".[\"");
+        finish_filter_preview(&mut app);
+
+        assert_eq!(app.tree.value_at(0), &json!([1, 2]));
+        assert_eq!(app.active_filter.as_deref(), Some(".left"));
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|message| message.contains("syntax error"))
+        );
+    }
+
+    #[test]
+    fn enter_keeps_and_escape_cancels_live_filter_results() {
+        let original = json!({"left": [1, 2], "right": [3, 4]});
+        let mut app = App::new(original.clone(), "test".into(), 1);
+        set_input(&mut app, ".left", InputMode::Filter);
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('|')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut app, ".right");
+        finish_filter_preview(&mut app);
+        assert_eq!(app.tree.value_at(0), &json!([3, 4]));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.tree.value_at(0), &json!([1, 2]));
+        assert_eq!(app.active_filter.as_deref(), Some(".left"));
+
+        app.handle_key(key(KeyCode::Char('|')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut app, ".right");
+        finish_filter_preview(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.tree.value_at(0), &json!([3, 4]));
+        assert_eq!(app.active_filter.as_deref(), Some(".right"));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.tree.value_at(0), &original);
+        assert!(app.active_filter.is_none());
     }
 
     #[test]

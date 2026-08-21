@@ -542,9 +542,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         lines[0],
     );
     let hint = if app.input_mode == InputMode::Filter {
-        app.message
-            .as_deref()
-            .unwrap_or("Enter apply   Esc cancel   Ctrl-u clear   Ctrl-w erase word")
+        if let Some(message) = app.message.as_deref() {
+            message
+        } else if app.is_filter_preview_pending() {
+            "Filtering…   Enter keep   Esc cancel"
+        } else {
+            "Live preview   Enter keep   Esc cancel   Ctrl-u clear   Ctrl-w erase word"
+        }
     } else {
         "↑↓/jk move   ←→/hl structure   / search   : path   | jq   p print   ? help"
     };
@@ -619,8 +623,8 @@ fn draw_help(frame: &mut Frame) {
             "Filter with jq",
             Style::default().fg(ACCENT).bold(),
         )),
-        Line::from("  |               edit a jq-compatible filter"),
-        Line::from("  Enter / Esc     apply / cancel filter editing"),
+        Line::from("  |               edit with live jq-compatible filtering"),
+        Line::from("  Enter / Esc     keep / cancel the live result"),
         Line::from("  Esc             clear an applied filter (after search)"),
         Line::from(""),
         Line::from(Span::styled(

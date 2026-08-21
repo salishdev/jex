@@ -17,7 +17,7 @@ pub struct FilterOutput {
     pub count: usize,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FilterError(String);
 
 impl FilterError {
@@ -35,11 +35,18 @@ impl fmt::Display for FilterError {
 impl Error for FilterError {}
 
 pub fn evaluate(input: &Value, program: &str) -> Result<FilterOutput, FilterError> {
+    let input = prepare(input)?;
+    evaluate_prepared(&input, program)
+}
+
+pub fn prepare(input: &Value) -> Result<Val, FilterError> {
     let input = serde_json::to_vec(input)
         .map_err(|error| FilterError::new(format!("could not prepare input: {error}")))?;
-    let input = jaq_json::read::parse_single(input.as_slice())
-        .map_err(|error| FilterError::new(format!("could not prepare input: {error}")))?;
+    jaq_json::read::parse_single(input.as_slice())
+        .map_err(|error| FilterError::new(format!("could not prepare input: {error}")))
+}
 
+pub fn evaluate_prepared(input: &Val, program: &str) -> Result<FilterOutput, FilterError> {
     let arena = Arena::default();
     let defs = jaq_core::defs()
         .chain(jaq_std::defs())
@@ -64,7 +71,7 @@ pub fn evaluate(input: &Value, program: &str) -> Result<FilterOutput, FilterErro
 
     let context = Ctx::<JustLut<Val>>::new(&filter.lut, Vars::new([]));
     let mut values = Vec::new();
-    for result in filter.id.run((context, input)).map(unwrap_valr) {
+    for result in filter.id.run((context, input.clone())).map(unwrap_valr) {
         if values.len() == MAX_FILTER_OUTPUTS {
             return Err(FilterError::new(format!(
                 "filter produced more than {MAX_FILTER_OUTPUTS} outputs; refine the expression"

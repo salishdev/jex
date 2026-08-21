@@ -55,7 +55,7 @@ JSON Pointer escaping follows RFC 6901: `/` inside an object key becomes `~1`, a
 
 ## Filtering with jq
 
-Press `|` to edit a jq-compatible expression, then press `Enter` to apply it. Filters always run against the original input document, so editing an applied filter does not create an implicit chain of transformations:
+Press `|` to edit a jq-compatible expression. The result tree updates as you type; press `Enter` to keep the current result or `Esc` to cancel the edit and restore the previous tree. Filters always run against the original input document, so editing an applied filter does not create an implicit chain of transformations:
 
 ```jq
 .users[] | select(.active) | {name, email}
@@ -63,7 +63,7 @@ Press `|` to edit a jq-compatible expression, then press `Enter` to apply it. Fi
 
 The filtered value becomes a normal browsable tree. A filter that emits several values displays them as a result array; a filter that emits no values displays an empty array. The header shows the active expression and its output count.
 
-While editing, use the arrow keys, `Home`, `End`, `Delete`, `Ctrl-u`, and `Ctrl-w` for line editing. `Enter` applies the expression and `Esc` cancels the edit. Syntax and runtime errors leave the editor open so you can correct them. In normal mode, `Esc` clears an active search first, then clears an applied filter and restores the original document.
+While editing, use the arrow keys, `Home`, `End`, `Delete`, `Ctrl-u`, and `Ctrl-w` for line editing. Live evaluation is briefly debounced and runs on a background worker, so expensive expressions do not block typing. Syntax and runtime errors leave the last valid preview in place while you correct the expression. In normal mode, `Esc` clears an active search first, then clears an applied filter and restores the original document.
 
 The embedded engine is [jaq](https://github.com/01mf02/jaq), which supports a large jq-compatible language without requiring a separate `jq` installation. Filter output is limited to 10,000 values to protect the interactive UI from unbounded result streams.
 
