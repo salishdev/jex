@@ -43,6 +43,8 @@ The left pane is the document tree. The right pane shows the complete JSON value
 
 You can click a row in the tree to select it, or click its disclosure marker to expand or collapse it. The mouse wheel follows the pointer and scrolls the pane beneath it without changing the selected tree node. Each scrollbar handle can be clicked and dragged, including the live filter preview's scrollbar. You can also drag the divider between the panes; both retain a minimum usable width.
 
+The pane split is remembered globally after a clean exit and restored the next time `jex` starts.
+
 ## Finding and returning
 
 - `/` searches keys, JSON Pointer paths, and scalar values across the entire document. A match is revealed even when its ancestors were collapsed. Use `n` and `N` to cycle through results.

@@ -27,6 +27,9 @@ use crate::{
     ui,
 };
 
+#[cfg(test)]
+use crate::ui_state::DEFAULT_TREE_PANE_PERCENT;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputMode {
     Normal,
@@ -35,7 +38,6 @@ pub enum InputMode {
     Filter,
 }
 
-const DEFAULT_TREE_PANE_PERCENT: u16 = 58;
 const MIN_PANE_WIDTH: u16 = 20;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const FILTER_PREVIEW_DEBOUNCE: Duration = Duration::from_millis(75);
@@ -147,6 +149,7 @@ pub struct App {
     filter_spinner_frame: usize,
     filter_spinner_deadline: Option<Instant>,
     pane_split_percent: u16,
+    pane_split_changed: bool,
     dragging_divider: bool,
     scrollbar_drag: Option<ScrollbarDrag>,
     last_tree_click: Option<(NodeId, Instant)>,
@@ -158,7 +161,17 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(value: Value, source: String, expand_depth: usize) -> Self {
+        Self::with_pane_split_percent(value, source, expand_depth, DEFAULT_TREE_PANE_PERCENT)
+    }
+
+    pub fn with_pane_split_percent(
+        value: Value,
+        source: String,
+        expand_depth: usize,
+        pane_split_percent: u16,
+    ) -> Self {
         let source_value = Arc::new(value);
         let tree = JsonTree::from_shared(Arc::clone(&source_value), expand_depth);
         let filter_worker = FilterWorker::new(Arc::clone(&source_value));
@@ -194,7 +207,8 @@ impl App {
             filter_preview_scroll: 0,
             filter_spinner_frame: 0,
             filter_spinner_deadline: None,
-            pane_split_percent: DEFAULT_TREE_PANE_PERCENT,
+            pane_split_percent: pane_split_percent.clamp(1, 99),
+            pane_split_changed: false,
             dragging_divider: false,
             scrollbar_drag: None,
             last_tree_click: None,
@@ -870,9 +884,25 @@ impl App {
         self.dragging_divider
     }
 
+    pub fn pane_split_percent(&self) -> u16 {
+        self.pane_split_percent
+    }
+
+    pub fn pane_split_changed(&self) -> bool {
+        self.pane_split_changed
+    }
+
+    fn set_pane_split_percent(&mut self, percent: u16) {
+        let percent = percent.clamp(1, 99);
+        if percent != self.pane_split_percent {
+            self.pane_split_percent = percent;
+            self.pane_split_changed = true;
+        }
+    }
+
     fn resize_panes(&mut self, percentage_points: i16) {
-        self.pane_split_percent =
-            (self.pane_split_percent as i16 + percentage_points).clamp(1, 99) as u16;
+        let percent = (self.pane_split_percent as i16 + percentage_points).clamp(1, 99) as u16;
+        self.set_pane_split_percent(percent);
     }
 
     fn resize_to_column(&mut self, column: u16, body: Rect) {
@@ -884,9 +914,9 @@ impl App {
         let maximum = body.width.saturating_sub(MIN_PANE_WIDTH).max(1);
         let minimum = MIN_PANE_WIDTH.min(maximum);
         let width = desired_width.clamp(minimum, maximum);
-        self.pane_split_percent = ((u32::from(width) * 100 + u32::from(body.width) / 2)
-            / u32::from(body.width))
-        .clamp(1, 99) as u16;
+        let percent = ((u32::from(width) * 100 + u32::from(body.width) / 2) / u32::from(body.width))
+            .clamp(1, 99) as u16;
+        self.set_pane_split_percent(percent);
     }
 
     pub(crate) fn tree_max_scroll(&self, viewport_height: u16) -> usize {
@@ -1295,6 +1325,26 @@ mod tests {
     }
 
     #[test]
+    fn pane_width_can_be_restored_and_tracks_later_changes() {
+        let mut app = App::with_pane_split_percent(json!({}), "test".into(), 1, 73);
+
+        assert_eq!(app.tree_pane_width(100), 73);
+        assert_eq!(app.pane_split_percent(), 73);
+        assert!(!app.pane_split_changed());
+
+        app.handle_key(key(KeyCode::Char('+')));
+        assert_eq!(app.pane_split_percent(), 78);
+        assert!(app.pane_split_changed());
+    }
+
+    #[test]
+    fn restored_pane_width_is_defensively_clamped() {
+        let app = App::with_pane_split_percent(json!({}), "test".into(), 1, u16::MAX);
+
+        assert_eq!(app.pane_split_percent(), 99);
+    }
+
+    #[test]
     fn divider_drag_resizes_and_clamps_the_panes() {
         let mut app = App::new(json!({}), "test".into(), 1);
         let body = Rect::new(0, 3, 100, 20);
@@ -1304,6 +1354,7 @@ mod tests {
 
         app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 74, 10), body);
         assert_eq!(app.tree_pane_width(body.width), 75);
+        assert!(app.pane_split_changed());
 
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 99, 10), body);
         assert!(!app.is_dragging_divider());

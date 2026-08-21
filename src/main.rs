@@ -2,6 +2,7 @@ mod app;
 mod filter;
 mod tree;
 mod ui;
+mod ui_state;
 
 use std::{
     fs,
@@ -39,8 +40,29 @@ fn main() -> Result<()> {
         }
     })?;
 
-    let mut app = App::new(value, source_name, cli.expand_depth);
+    let state_path = ui_state::state_path();
+    let saved_state = state_path
+        .as_deref()
+        .map(ui_state::load_or_default)
+        .unwrap_or_default();
+    let mut app = App::with_pane_split_percent(
+        value,
+        source_name,
+        cli.expand_depth,
+        saved_state.tree_pane_percent,
+    );
     app::run(&mut app)?;
+
+    if app.pane_split_changed()
+        && let Some(path) = state_path
+        && let Err(error) = ui_state::save(&path, app.pane_split_percent())
+    {
+        eprintln!(
+            "warning: could not save UI state to {}: {error}",
+            path.display()
+        );
+    }
+
     if let Some(output) = app.output {
         println!("{output}");
     }
