@@ -84,20 +84,24 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
-    let items = app
-        .visible
+    let selected = app.selected_visible_index();
+    let viewport_height = usize::from(tree_items_area(area).height);
+    let offset = selected.saturating_sub(viewport_height.saturating_sub(1));
+    let end = offset
+        .saturating_add(viewport_height)
+        .min(app.visible.len());
+    let items = app.visible[offset..end]
         .iter()
         .map(|&id| tree_item(app, id))
         .collect::<Vec<_>>();
-    let mut state = ListState::default().with_selected(Some(app.selected_visible_index()));
+    let mut state = ListState::default().with_selected(Some(selected.saturating_sub(offset)));
     let list = List::new(items)
         .block(tree_block(app))
         .highlight_style(Style::default().bg(Color::Rgb(34, 50, 60)).fg(Color::White))
         .highlight_symbol("▌");
     frame.render_stateful_widget(list, area, &mut state);
 
-    let mut scrollbar_state =
-        ScrollbarState::new(app.visible.len()).position(app.selected_visible_index());
+    let mut scrollbar_state = ScrollbarState::new(app.visible.len()).position(selected);
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
         .end_symbol(None)
@@ -142,7 +146,7 @@ fn tree_item(app: &App, id: NodeId) -> ListItem<'static> {
     } else {
         "▸"
     };
-    let is_match = app.matches.contains(&id);
+    let is_match = app.is_match(id);
     let label_style = kind_style(node.kind).add_modifier(if is_match {
         Modifier::UNDERLINED
     } else {
@@ -160,15 +164,18 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     let (header_area, preview_area) = preview_areas(area);
     frame.render_widget(preview_header(app, header_area), header_area);
 
-    let preview = preview_widget(app);
-    let content_height = preview.line_count(preview_area.width);
+    let content_height = app.tree.pretty_line_count(app.selected);
     let maximum_scroll = content_height.saturating_sub(usize::from(preview_area.height));
-    let scroll = usize::from(app.preview_scroll).min(maximum_scroll) as u16;
-    frame.render_widget(preview.scroll((scroll, 0)), preview_area);
+    let scroll = app.preview_scroll.min(maximum_scroll);
+    let preview = preview_text(app, scroll, usize::from(preview_area.height));
+    frame.render_widget(
+        Paragraph::new(preview).wrap(Wrap { trim: false }),
+        preview_area,
+    );
 
     if maximum_scroll > 0 {
         let mut scrollbar_state = ScrollbarState::new(content_height)
-            .position(usize::from(scroll))
+            .position(scroll)
             .viewport_content_length(usize::from(preview_area.height));
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -176,11 +183,6 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
             .track_symbol(None);
         frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
     }
-}
-
-fn preview_widget(app: &App) -> Paragraph<'static> {
-    let value = app.tree.value_at(app.selected);
-    Paragraph::new(highlight_json(value)).wrap(Wrap { trim: false })
 }
 
 fn preview_areas(area: Rect) -> (Rect, Rect) {
@@ -335,72 +337,152 @@ pub(crate) fn breadcrumb_target_at(app: &App, area: Rect, position: Position) ->
         .map(|target| target.id)
 }
 
-pub(crate) fn preview_max_scroll(app: &App, area: Rect) -> u16 {
+pub(crate) fn preview_max_scroll(app: &App, area: Rect) -> usize {
     let (_, area) = preview_areas(area);
-    let content_height = preview_widget(app).line_count(area.width);
-    content_height
+    app.tree
+        .pretty_line_count(app.selected)
         .saturating_sub(usize::from(area.height))
-        .min(usize::from(u16::MAX)) as u16
 }
 
-fn highlight_json(value: &Value) -> Text<'static> {
-    let mut lines = vec![Vec::new()];
-    push_json(value, 0, &mut lines);
-    Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+fn preview_text(app: &App, start: usize, height: usize) -> Text<'static> {
+    let mut collector = PreviewCollector {
+        skip: start,
+        limit: height,
+        lines: Vec::with_capacity(height),
+    };
+    render_json_node(app, app.selected, 0, Vec::new(), false, &mut collector);
+    Text::from(
+        collector
+            .lines
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>(),
+    )
 }
 
-fn push_json(value: &Value, depth: usize, lines: &mut Vec<Vec<Span<'static>>>) {
-    match value {
-        Value::Object(map) if map.is_empty() => push_span(lines, "{}", punctuation_style()),
-        Value::Object(map) => {
-            push_span(lines, "{", punctuation_style());
-            let last = map.len() - 1;
-            for (index, (key, value)) in map.iter().enumerate() {
-                lines.push(vec![Span::raw("  ".repeat(depth + 1))]);
-                push_span(
-                    lines,
-                    serde_json::to_string(key).expect("JSON object keys are serializable"),
-                    Style::default().fg(ACCENT),
-                );
-                push_span(lines, ": ", punctuation_style());
-                push_json(value, depth + 1, lines);
-                if index != last {
-                    push_span(lines, ",", punctuation_style());
-                }
-            }
-            lines.push(vec![Span::raw("  ".repeat(depth))]);
-            push_span(lines, "}", punctuation_style());
+struct PreviewCollector {
+    skip: usize,
+    limit: usize,
+    lines: Vec<Vec<Span<'static>>>,
+}
+
+impl PreviewCollector {
+    fn is_full(&self) -> bool {
+        self.lines.len() >= self.limit
+    }
+
+    fn emit(&mut self, line: Vec<Span<'static>>) {
+        if self.skip > 0 {
+            self.skip -= 1;
+        } else if !self.is_full() {
+            self.lines.push(line);
         }
-        Value::Array(items) if items.is_empty() => push_span(lines, "[]", punctuation_style()),
-        Value::Array(items) => {
-            push_span(lines, "[", punctuation_style());
-            let last = items.len() - 1;
-            for (index, value) in items.iter().enumerate() {
-                lines.push(vec![Span::raw("  ".repeat(depth + 1))]);
-                push_json(value, depth + 1, lines);
-                if index != last {
-                    push_span(lines, ",", punctuation_style());
-                }
-            }
-            lines.push(vec![Span::raw("  ".repeat(depth))]);
-            push_span(lines, "]", punctuation_style());
-        }
-        Value::String(value) => push_span(
-            lines,
-            serde_json::to_string(value).expect("JSON strings are serializable"),
-            kind_style(NodeKind::String),
-        ),
-        Value::Number(value) => push_span(lines, value.to_string(), kind_style(NodeKind::Number)),
-        Value::Bool(value) => push_span(lines, value.to_string(), kind_style(NodeKind::Bool)),
-        Value::Null => push_span(lines, "null", kind_style(NodeKind::Null)),
     }
 }
 
-fn push_span(lines: &mut [Vec<Span<'static>>], content: impl Into<String>, style: Style) {
-    lines
-        .last_mut()
-        .expect("JSON output always has a current line")
-        .push(Span::styled(content.into(), style));
+fn render_json_node(
+    app: &App,
+    id: NodeId,
+    depth: usize,
+    mut prefix: Vec<Span<'static>>,
+    trailing_comma: bool,
+    collector: &mut PreviewCollector,
+) {
+    if collector.is_full() {
+        return;
+    }
+    let line_count = app.tree.pretty_line_count(id);
+    if collector.skip >= line_count {
+        collector.skip -= line_count;
+        return;
+    }
+
+    let node = app.tree.node(id);
+    if node.children.is_empty() {
+        let value = app.tree.value_at(id);
+        let (content, style) = match value {
+            Value::Object(_) => ("{}".into(), punctuation_style()),
+            Value::Array(_) => ("[]".into(), punctuation_style()),
+            Value::String(value) => (
+                serde_json::to_string(value).expect("JSON strings are serializable"),
+                kind_style(NodeKind::String),
+            ),
+            Value::Number(value) => (value.to_string(), kind_style(NodeKind::Number)),
+            Value::Bool(value) => (value.to_string(), kind_style(NodeKind::Bool)),
+            Value::Null => ("null".into(), kind_style(NodeKind::Null)),
+        };
+        prefix.push(Span::styled(content, style));
+        if trailing_comma {
+            prefix.push(Span::styled(",", punctuation_style()));
+        }
+        collector.emit(prefix);
+        return;
+    }
+
+    let (opening, closing) = match node.kind {
+        NodeKind::Object => ("{", "}"),
+        NodeKind::Array => ("[", "]"),
+        _ => unreachable!("only containers have child nodes"),
+    };
+    prefix.push(Span::styled(opening, punctuation_style()));
+    collector.emit(prefix);
+
+    let last = node.children.len() - 1;
+    let first_child = if collector.skip == 0 {
+        0
+    } else {
+        let children_start = app.tree.pretty_line_start(id) + 1;
+        let target = children_start + collector.skip;
+        let index = node.children.partition_point(|&child| {
+            app.tree.pretty_line_start(child) + app.tree.pretty_line_count(child) <= target
+        });
+        let skipped_lines = if index < node.children.len() {
+            app.tree.pretty_line_start(node.children[index]) - children_start
+        } else {
+            line_count - 2
+        };
+        collector.skip -= skipped_lines;
+        index
+    };
+    for (index, &child) in node.children.iter().enumerate().skip(first_child) {
+        let mut child_prefix = vec![Span::raw("  ".repeat(depth + 1))];
+        if node.kind == NodeKind::Object {
+            let crate::tree::Segment::Key(key) = app
+                .tree
+                .node(child)
+                .segment
+                .as_ref()
+                .expect("object children have key segments")
+            else {
+                unreachable!("object children have key segments");
+            };
+            child_prefix.push(Span::styled(
+                serde_json::to_string(key).expect("JSON object keys are serializable"),
+                Style::default().fg(ACCENT),
+            ));
+            child_prefix.push(Span::styled(": ", punctuation_style()));
+        }
+        render_json_node(
+            app,
+            child,
+            depth + 1,
+            child_prefix,
+            index != last,
+            collector,
+        );
+        if collector.is_full() {
+            return;
+        }
+    }
+
+    let mut closing_line = vec![
+        Span::raw("  ".repeat(depth)),
+        Span::styled(closing, punctuation_style()),
+    ];
+    if trailing_comma {
+        closing_line.push(Span::styled(",", punctuation_style()));
+    }
+    collector.emit(closing_line);
 }
 
 fn punctuation_style() -> Style {
@@ -547,7 +629,8 @@ mod tests {
     #[test]
     fn highlighted_json_preserves_pretty_printed_content() {
         let value = json!({"name": "Ada\nLovelace", "active": true, "score": 42, "other": null});
-        let text = highlight_json(&value);
+        let app = App::new(value.clone(), "test".into(), 0);
+        let text = preview_text(&app, 0, app.tree.pretty_line_count(0));
         let rendered = text
             .lines
             .iter()
@@ -565,8 +648,12 @@ mod tests {
 
     #[test]
     fn highlighted_json_styles_each_token_kind() {
-        let text =
-            highlight_json(&json!({"text": "hello", "number": 7, "bool": false, "nil": null}));
+        let app = App::new(
+            json!({"text": "hello", "number": 7, "bool": false, "nil": null}),
+            "test".into(),
+            0,
+        );
+        let text = preview_text(&app, 0, app.tree.pretty_line_count(0));
         let spans = text.lines.iter().flat_map(|line| &line.spans);
         let style_for = |needle: &str| {
             spans
@@ -581,6 +668,43 @@ mod tests {
         assert_eq!(style_for("false"), Some(Color::Yellow));
         assert_eq!(style_for("null"), Some(MUTED));
         assert_eq!(style_for("{"), Some(Color::Gray));
+    }
+
+    #[test]
+    fn preview_generation_returns_only_the_requested_window() {
+        let value = json!({
+            "alpha": [1, 2, 3],
+            "beta": {"nested": true},
+            "gamma": null,
+        });
+        let expected = serde_json::to_string_pretty(&value)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let app = App::new(value, "test".into(), 0);
+
+        let text = preview_text(&app, 3, 4);
+        let actual = text.lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert_eq!(actual, expected[3..7]);
+    }
+
+    #[test]
+    fn preview_scroll_supports_documents_longer_than_u16() {
+        let value = Value::Array((0..70_000).map(Value::from).collect());
+        let app = App::new(value, "test".into(), 0);
+
+        let maximum = preview_max_scroll(&app, Rect::new(0, 0, 80, 20));
+        let tail_start = app.tree.pretty_line_count(0) - 3;
+        let tail = preview_text(&app, tail_start, 3)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(maximum > usize::from(u16::MAX));
+        assert_eq!(tail, ["  69998,", "  69999", "]"]);
     }
 
     #[test]

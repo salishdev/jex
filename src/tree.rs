@@ -27,6 +27,9 @@ pub struct Node {
     pub kind: NodeKind,
     pub summary: String,
     pub expanded: bool,
+    pretty_start: usize,
+    pretty_lines: usize,
+    subtree_end: NodeId,
 }
 
 #[derive(Debug)]
@@ -37,42 +40,25 @@ pub struct JsonTree {
 
 impl JsonTree {
     pub fn new(value: Value, expand_depth: usize) -> Self {
-        let mut tree = Self {
-            value,
-            nodes: Vec::new(),
-        };
-        tree.build(None, None, 0, expand_depth);
-        tree
+        let mut nodes = Vec::new();
+        Self::build_value(&value, &mut nodes, None, None, 0, expand_depth, 0);
+        Self { value, nodes }
     }
 
-    fn build(
-        &mut self,
+    fn build_value(
+        value: &Value,
+        nodes: &mut Vec<Node>,
         parent: Option<NodeId>,
         segment: Option<Segment>,
         depth: usize,
         expand_depth: usize,
+        pretty_start: usize,
     ) -> NodeId {
-        let value = match (&parent, &segment) {
-            (None, None) => &self.value,
-            (Some(parent), Some(segment)) => {
-                let parent_value = self.value_at(*parent);
-                match segment {
-                    Segment::Key(key) => &parent_value[key],
-                    Segment::Index(index) => &parent_value[*index],
-                }
-            }
-            _ => unreachable!("only the root has no parent and segment"),
-        };
         let kind = NodeKind::of(value);
         let summary = summary(value);
-        let child_segments = match value {
-            Value::Object(map) => map.keys().cloned().map(Segment::Key).collect(),
-            Value::Array(items) => (0..items.len()).map(Segment::Index).collect(),
-            _ => Vec::new(),
-        };
 
-        let id = self.nodes.len();
-        self.nodes.push(Node {
+        let id = nodes.len();
+        nodes.push(Node {
             parent,
             children: Vec::new(),
             segment,
@@ -80,12 +66,55 @@ impl JsonTree {
             kind,
             summary,
             expanded: depth < expand_depth,
+            pretty_start,
+            pretty_lines: 1,
+            subtree_end: id + 1,
         });
 
-        for child_segment in child_segments {
-            let child = self.build(Some(id), Some(child_segment), depth + 1, expand_depth);
-            self.nodes[id].children.push(child);
+        match value {
+            Value::Object(map) => {
+                let mut child_start = pretty_start + 1;
+                for (key, child_value) in map {
+                    let child = Self::build_value(
+                        child_value,
+                        nodes,
+                        Some(id),
+                        Some(Segment::Key(key.clone())),
+                        depth + 1,
+                        expand_depth,
+                        child_start,
+                    );
+                    child_start += nodes[child].pretty_lines;
+                    nodes[id].children.push(child);
+                }
+            }
+            Value::Array(items) => {
+                let mut child_start = pretty_start + 1;
+                for (index, child_value) in items.iter().enumerate() {
+                    let child = Self::build_value(
+                        child_value,
+                        nodes,
+                        Some(id),
+                        Some(Segment::Index(index)),
+                        depth + 1,
+                        expand_depth,
+                        child_start,
+                    );
+                    child_start += nodes[child].pretty_lines;
+                    nodes[id].children.push(child);
+                }
+            }
+            _ => {}
         }
+
+        if !nodes[id].children.is_empty() {
+            nodes[id].pretty_lines = 2 + nodes[id]
+                .children
+                .iter()
+                .map(|&child| nodes[child].pretty_lines)
+                .sum::<usize>();
+        }
+        nodes[id].subtree_end = nodes.len();
         id
     }
 
@@ -99,6 +128,14 @@ impl JsonTree {
 
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub fn pretty_line_count(&self, id: NodeId) -> usize {
+        self.nodes[id].pretty_lines
+    }
+
+    pub fn pretty_line_start(&self, id: NodeId) -> usize {
+        self.nodes[id].pretty_start
     }
 
     pub fn value_at(&self, id: NodeId) -> &Value {
@@ -124,18 +161,15 @@ impl JsonTree {
 
     pub fn visible(&self) -> Vec<NodeId> {
         let mut visible = Vec::new();
-        self.collect_visible(0, &mut visible);
-        visible
-    }
-
-    fn collect_visible(&self, id: NodeId, visible: &mut Vec<NodeId>) {
-        visible.push(id);
-        let node = &self.nodes[id];
-        if node.expanded {
-            for &child in &node.children {
-                self.collect_visible(child, visible);
+        let mut pending = vec![0];
+        while let Some(id) = pending.pop() {
+            visible.push(id);
+            let node = &self.nodes[id];
+            if node.expanded {
+                pending.extend(node.children.iter().rev().copied());
             }
         }
+        visible
     }
 
     pub fn path(&self, id: NodeId) -> String {
@@ -211,30 +245,63 @@ impl JsonTree {
         }
     }
 
+    pub fn search(&self, query: &str) -> Vec<NodeId> {
+        let mut matches = Vec::new();
+        let mut path = String::new();
+        let mut path_lengths = Vec::new();
+
+        for (id, node) in self.nodes.iter().enumerate() {
+            let label_matches;
+            if node.depth == 0 {
+                path.clear();
+                label_matches = "$".contains(query);
+            } else {
+                path.truncate(path_lengths[node.depth - 1]);
+                path.push('/');
+                match node.segment.as_ref().expect("non-root nodes have segments") {
+                    Segment::Key(key) => {
+                        let key = key.to_lowercase();
+                        label_matches = key.contains(query);
+                        path.push_str(&escape_pointer(&key));
+                    }
+                    Segment::Index(index) => {
+                        label_matches = (query.contains('[') || query.contains(']'))
+                            && format!("[{index}]").contains(query);
+                        path.push_str(&index.to_string());
+                    }
+                }
+            }
+            if path_lengths.len() <= node.depth {
+                path_lengths.push(path.len());
+            } else {
+                path_lengths[node.depth] = path.len();
+            }
+
+            let path_matches = if id == 0 {
+                "/".contains(query)
+            } else {
+                path.contains(query)
+            };
+            if path_matches || label_matches || node.summary.to_lowercase().contains(query) {
+                matches.push(id);
+            }
+        }
+
+        matches
+    }
+
     pub fn collapse_descendants(&mut self, id: NodeId) {
-        let children = self.nodes[id].children.clone();
-        for child in children {
-            self.nodes[child].expanded = false;
-            self.collapse_descendants(child);
+        let subtree_end = self.nodes[id].subtree_end;
+        for node in &mut self.nodes[id + 1..subtree_end] {
+            node.expanded = false;
         }
     }
 
     pub fn expand_descendants(&mut self, id: NodeId) {
-        self.nodes[id].expanded = true;
-        let children = self.nodes[id].children.clone();
-        for child in children {
-            self.expand_descendants(child);
+        let subtree_end = self.nodes[id].subtree_end;
+        for node in &mut self.nodes[id..subtree_end] {
+            node.expanded = true;
         }
-    }
-
-    pub fn searchable_text(&self, id: NodeId) -> String {
-        format!(
-            "{} {} {}",
-            self.path(id),
-            self.label(id),
-            self.nodes[id].summary
-        )
-        .to_lowercase()
     }
 }
 
@@ -345,5 +412,20 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(labels, vec!["$", "a", "[0]", "b"]);
+    }
+
+    #[test]
+    fn search_matches_raw_keys_escaped_paths_and_values() {
+        let tree = JsonTree::new(json!({"A/B": [{"name": "Needle"}]}), 0);
+        let keyed = tree.find_pointer("/A~1B").unwrap();
+        let value = tree.find_pointer("/A~1B/0/name").unwrap();
+
+        assert!(tree.search("a/b").contains(&keyed));
+        assert!(tree.search("a~1b/0").contains(&value));
+        assert!(tree.search("needle").contains(&value));
+        assert!(
+            tree.search("[0]")
+                .contains(&tree.find_pointer("/A~1B/0").unwrap())
+        );
     }
 }

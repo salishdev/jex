@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     io::{self, Write},
     time::{Duration, Instant},
 };
@@ -40,24 +41,27 @@ pub struct App {
     pub input: String,
     pub search_query: Option<String>,
     pub matches: Vec<NodeId>,
+    match_set: HashSet<NodeId>,
     pub match_index: Option<usize>,
     pub bookmark: Option<NodeId>,
     pub message: Option<String>,
     pub show_help: bool,
     pub output: Option<String>,
-    pub preview_scroll: u16,
+    pub preview_scroll: usize,
     pane_split_percent: u16,
     dragging_divider: bool,
     last_tree_click: Option<(NodeId, Instant)>,
     should_quit: bool,
     history: Vec<NodeId>,
     history_index: usize,
+    visible_positions: HashMap<NodeId, usize>,
 }
 
 impl App {
     pub fn new(value: Value, source: String, expand_depth: usize) -> Self {
         let tree = JsonTree::new(value, expand_depth);
         let visible = tree.visible();
+        let visible_positions = Self::index_visible_nodes(&visible);
         Self {
             tree,
             source,
@@ -67,6 +71,7 @@ impl App {
             input: String::new(),
             search_query: None,
             matches: Vec::new(),
+            match_set: HashSet::new(),
             match_index: None,
             bookmark: None,
             message: None,
@@ -79,19 +84,33 @@ impl App {
             should_quit: false,
             history: vec![0],
             history_index: 0,
+            visible_positions,
         }
     }
 
     pub fn selected_visible_index(&self) -> usize {
-        self.visible
-            .iter()
-            .position(|&id| id == self.selected)
+        self.visible_positions
+            .get(&self.selected)
+            .copied()
             .unwrap_or(0)
+    }
+
+    pub fn is_match(&self, id: NodeId) -> bool {
+        self.match_set.contains(&id)
+    }
+
+    fn index_visible_nodes(visible: &[NodeId]) -> HashMap<NodeId, usize> {
+        let mut positions = HashMap::with_capacity(visible.len());
+        for (index, &id) in visible.iter().enumerate() {
+            positions.insert(id, index);
+        }
+        positions
     }
 
     fn refresh_visible(&mut self) {
         self.visible = self.tree.visible();
-        if !self.visible.contains(&self.selected) {
+        self.visible_positions = Self::index_visible_nodes(&self.visible);
+        if !self.visible_positions.contains_key(&self.selected) {
             self.selected = self.visible.first().copied().unwrap_or(0);
         }
     }
@@ -170,6 +189,7 @@ impl App {
             (KeyCode::Esc, _) => {
                 self.search_query = None;
                 self.matches.clear();
+                self.match_set.clear();
                 self.match_index = None;
             }
             _ => {}
@@ -284,13 +304,13 @@ impl App {
         if query.is_empty() {
             self.search_query = None;
             self.matches.clear();
+            self.match_set.clear();
             self.match_index = None;
             return;
         }
         self.search_query = Some(query.clone());
-        self.matches = (0..self.tree.len())
-            .filter(|&id| self.tree.searchable_text(id).contains(&query))
-            .collect();
+        self.matches = self.tree.search(&query);
+        self.match_set = self.matches.iter().copied().collect();
         if self.matches.is_empty() {
             self.match_index = None;
             self.message = Some(format!("No matches for {query:?}"));
@@ -478,9 +498,9 @@ impl App {
         let maximum = ui::preview_max_scroll(self, area);
         let current = self.preview_scroll.min(maximum);
         self.preview_scroll = if direction < 0 {
-            current.saturating_sub(direction.unsigned_abs() as u16)
+            current.saturating_sub(direction.unsigned_abs())
         } else {
-            current.saturating_add(direction as u16).min(maximum)
+            current.saturating_add(direction as usize).min(maximum)
         };
     }
 
@@ -552,18 +572,24 @@ pub fn run(app: &mut App) -> Result<()> {
     let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend)?;
 
+    terminal.draw(|frame| ui::draw(frame, app))?;
     while !app.should_quit {
-        terminal.draw(|frame| ui::draw(frame, app))?;
-        if event::poll(Duration::from_millis(250))? {
-            match event::read()? {
-                Event::Key(key) => app.handle_key(key),
-                Event::Mouse(mouse) => {
-                    let size = terminal.size()?;
-                    let area = Rect::new(0, 0, size.width, size.height);
-                    app.handle_mouse(mouse, ui::body_area(area));
-                }
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+        let should_redraw = match event::read()? {
+            Event::Key(key) => {
+                app.handle_key(key);
+                true
             }
+            Event::Mouse(mouse) => {
+                let size = terminal.size()?;
+                let area = Rect::new(0, 0, size.width, size.height);
+                app.handle_mouse(mouse, ui::body_area(area));
+                true
+            }
+            Event::Resize(_, _) => true,
+            Event::FocusGained | Event::FocusLost | Event::Paste(_) => false,
+        };
+        if should_redraw && !app.should_quit {
+            terminal.draw(|frame| ui::draw(frame, app))?;
         }
     }
 
@@ -635,6 +661,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.tree.path(app.selected), "/a/needle");
         assert!(app.visible.contains(&app.selected));
+        assert!(app.matches.iter().all(|&id| app.is_match(id)));
         app.handle_key(key(KeyCode::Char('n')));
         assert_eq!(app.tree.path(app.selected), "/needle2");
     }
