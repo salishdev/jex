@@ -89,16 +89,7 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(app.selected_visible_index()));
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::RIGHT)
-                .border_style(if app.is_dragging_divider() {
-                    Style::default().fg(ACCENT)
-                } else {
-                    Style::default().fg(MUTED)
-                })
-                .title(format!(" Tree  {}/{} ", app.visible.len(), app.tree.len())),
-        )
+        .block(tree_block(app))
         .highlight_style(Style::default().bg(Color::Rgb(34, 50, 60)).fg(Color::White))
         .highlight_symbol("▌");
     frame.render_stateful_widget(list, area, &mut state);
@@ -117,6 +108,26 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         }),
         &mut scrollbar_state,
     );
+}
+
+fn tree_block(app: &App) -> Block<'static> {
+    Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(if app.is_dragging_divider() {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(MUTED)
+        })
+        .title(format!(" Tree  {}/{} ", app.visible.len(), app.tree.len()))
+}
+
+pub(crate) fn tree_items_area(area: Rect) -> Rect {
+    // Keep mouse hit-testing aligned with the exact inset Ratatui applies for the
+    // tree block's top title and right border.
+    Block::default()
+        .borders(Borders::RIGHT)
+        .title(" ")
+        .inner(area)
 }
 
 fn tree_item(app: &App, id: NodeId) -> ListItem<'static> {
@@ -305,7 +316,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let area = centered_rect(68, 28, frame.area());
+    let area = centered_rect(68, 29, frame.area());
     frame.render_widget(Clear, area);
     let help = vec![
         Line::from(Span::styled("Navigate", Style::default().fg(ACCENT).bold())),
@@ -333,6 +344,7 @@ fn draw_help(frame: &mut Frame) {
         Line::from("  e/c             expand / collapse the entire branch"),
         Line::from("  -/+             resize the tree and value panes"),
         Line::from("  Mouse click     select a tree row; disclosure toggles it"),
+        Line::from("  Double-click    expand or collapse a container row"),
         Line::from("  Mouse wheel     move the tree or scroll the hovered value"),
         Line::from("  Mouse drag      resize using the pane divider"),
         Line::from("  Esc             clear the active search"),

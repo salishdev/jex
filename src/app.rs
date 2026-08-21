@@ -1,6 +1,6 @@
 use std::{
     io::{self, Write},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -29,6 +29,7 @@ pub enum InputMode {
 
 const DEFAULT_TREE_PANE_PERCENT: u16 = 58;
 const MIN_PANE_WIDTH: u16 = 20;
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct App {
     pub tree: JsonTree,
@@ -47,6 +48,7 @@ pub struct App {
     pub preview_scroll: u16,
     pane_split_percent: u16,
     dragging_divider: bool,
+    last_tree_click: Option<(NodeId, Instant)>,
     should_quit: bool,
     history: Vec<NodeId>,
     history_index: usize,
@@ -73,6 +75,7 @@ impl App {
             preview_scroll: 0,
             pane_split_percent: DEFAULT_TREE_PANE_PERCENT,
             dragging_divider: false,
+            last_tree_click: None,
             should_quit: false,
             history: vec![0],
             history_index: 0,
@@ -427,25 +430,46 @@ impl App {
             .saturating_sub(usize::from(viewport_height).saturating_sub(1))
     }
 
-    fn select_tree_row(&mut self, mouse: MouseEvent, body: Rect) {
-        let row = usize::from(mouse.row.saturating_sub(body.y));
-        let index = self.tree_view_offset(body.height).saturating_add(row);
+    fn select_tree_row(&mut self, mouse: MouseEvent, tree_area: Rect) {
+        let items_area = ui::tree_items_area(tree_area);
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        if !items_area.contains(position) {
+            self.last_tree_click = None;
+            return;
+        }
+
+        let row = usize::from(mouse.row.saturating_sub(items_area.y));
+        let index = self.tree_view_offset(items_area.height).saturating_add(row);
         let Some(&id) = self.visible.get(index) else {
+            self.last_tree_click = None;
             return;
         };
 
         let indent_width = self.tree.node(id).depth.min(usize::from(u16::MAX)) as u16;
-        let disclosure_column = body
+        let disclosure_column = items_area
             .x
             .saturating_add(1) // the list's selection marker
             .saturating_add(indent_width.saturating_mul(2));
         let clicked_disclosure = mouse.column == disclosure_column;
+        let now = Instant::now();
+        let double_clicked_row = !clicked_disclosure
+            && self
+                .last_tree_click
+                .is_some_and(|(previous_id, previous_time)| {
+                    previous_id == id
+                        && now.saturating_duration_since(previous_time) <= DOUBLE_CLICK_INTERVAL
+                });
+        self.last_tree_click = if clicked_disclosure || double_clicked_row {
+            None
+        } else {
+            Some((id, now))
+        };
         let selected_before = self.selected;
         self.selected = id;
         if self.selected != selected_before {
             self.preview_scroll = 0;
         }
-        if clicked_disclosure {
+        if clicked_disclosure || double_clicked_row {
             self.toggle_current();
         }
     }
@@ -470,6 +494,7 @@ impl App {
             && mouse.column >= body.x
             && mouse.column < body.right();
         let tree_width = self.tree_pane_width(body.width);
+        let tree_area = Rect::new(body.x, body.y, tree_width, body.height);
         let right_x = body.x.saturating_add(tree_width);
         let right_area = Rect::new(
             right_x,
@@ -490,10 +515,13 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) if over_body => {
                 let divider = body.x.saturating_add(tree_width).saturating_sub(1);
                 if mouse.column.abs_diff(divider) <= 1 {
+                    self.last_tree_click = None;
                     self.dragging_divider = true;
                     self.resize_to_column(mouse.column, body);
                 } else if mouse.column < divider {
-                    self.select_tree_row(mouse, body);
+                    self.select_tree_row(mouse, tree_area);
+                } else {
+                    self.last_tree_click = None;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
@@ -503,6 +531,7 @@ impl App {
                 self.resize_to_column(mouse.column, body);
                 self.dragging_divider = false;
             }
+            MouseEventKind::Down(MouseButton::Left) => self.last_tree_click = None,
             _ => {}
         }
         if self.selected != selected_before {
@@ -671,7 +700,24 @@ mod tests {
         let mut app = App::new(json!({"a": 1, "b": 2}), "test".into(), 1);
         let body = Rect::new(0, 3, 100, 10);
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 5), body);
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, body.y + 3),
+            body,
+        );
+
+        assert_eq!(app.tree.path(app.selected), "/b");
+    }
+
+    #[test]
+    fn clicking_the_tree_title_does_not_select_a_row() {
+        let mut app = App::new(json!({"a": 1, "b": 2}), "test".into(), 1);
+        let body = Rect::new(0, 3, 100, 10);
+        app.selected = app.tree.find_pointer("/b").unwrap();
+
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, body.y),
+            body,
+        );
 
         assert_eq!(app.tree.path(app.selected), "/b");
     }
@@ -684,11 +730,11 @@ mod tests {
         app.selected = app.visible[15];
 
         app.handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 10, body.y),
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, body.y + 1),
             body,
         );
 
-        assert_eq!(app.selected_visible_index(), 11);
+        assert_eq!(app.selected_visible_index(), 12);
     }
 
     #[test]
@@ -697,12 +743,33 @@ mod tests {
         let body = Rect::new(0, 3, 100, 10);
 
         app.handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 1, body.y),
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, body.y + 1),
             body,
         );
 
         assert!(!app.tree.node(0).expanded);
         assert_eq!(app.visible, vec![0]);
+    }
+
+    #[test]
+    fn double_clicking_a_container_row_toggles_it() {
+        let mut app = App::new(json!({"a": {"b": 1}}), "test".into(), 2);
+        let body = Rect::new(0, 3, 100, 10);
+        let click = mouse(MouseEventKind::Down(MouseButton::Left), 6, body.y + 2);
+
+        app.handle_mouse(click, body);
+        let container = app.tree.find_pointer("/a").unwrap();
+        assert_eq!(app.selected, container);
+        assert!(app.tree.node(container).expanded);
+
+        app.handle_mouse(click, body);
+        assert!(!app.tree.node(container).expanded);
+        assert_eq!(app.visible, vec![0, container]);
+
+        app.handle_mouse(click, body);
+        app.handle_mouse(click, body);
+        assert!(app.tree.node(container).expanded);
+        assert_eq!(app.visible.len(), 3);
     }
 
     #[test]
